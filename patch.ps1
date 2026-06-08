@@ -419,153 +419,6 @@ $RTL_INJECTION_CODE = @'
     } catch(e) { console.error('[Claude RTL]', e); }
 })();
 // --- CLAUDE RTL PATCH END ---
-// --- CLAUDE WCO FIX START ---
-;(function() {
-    'use strict';
-    try {
-        if (typeof navigator === 'undefined' || typeof document === 'undefined') return;
-        // Feature-detect + locale fallback. If the WCO API isn't available and the
-        // OS locale is LTR, this whole block becomes a silent no-op.
-        var wco = ('windowControlsOverlay' in navigator) ? navigator.windowControlsOverlay : null;
-        var locale = ((navigator.language || '') + ',' + (navigator.languages || []).join(',')).toLowerCase();
-        var LOCALE_IS_RTL = /\b(he|iw|ar|fa|ur|yi|ps|sd)\b/.test(locale);
-        var FALLBACK_PAD_PX = 140; // Default Windows titleBarOverlay width at 100% DPI
-        if (!wco && !LOCALE_IS_RTL) {
-            window.__claudeWCOState = { source: 'none', reason: 'no-api-and-ltr-locale', locale: locale };
-            return;
-        }
-
-        var STYLE_ID = 'claude-wco-fix';
-        var TARGET_ATTR = 'data-claude-wco-target';
-        var retryCount = 0;
-        var MAX_RETRIES = 20; // ~10 seconds total at 500ms interval
-
-        function removeAll() {
-            var style = document.getElementById(STYLE_ID);
-            if (style) style.remove();
-            var marked = document.querySelectorAll('[' + TARGET_ATTR + ']');
-            for (var i = 0; i < marked.length; i++) {
-                marked[i].removeAttribute(TARGET_ATTR);
-            }
-        }
-
-        // The title bar is the element Electron marks as the OS drag region.
-        // In Claude Desktop it's always the element with class `draggable` (as
-        // opposed to `draggable-none`, which marks non-drag subregions).
-        // Padding on this overlay moves only the title-bar buttons, not the
-        // app body — which is exactly what we want.
-        function findTopBar() {
-            return document.querySelector('.draggable:not(.draggable-none)');
-        }
-
-        function applyFix() {
-            try {
-                var rect = (wco && typeof wco.getTitlebarAreaRect === 'function')
-                    ? wco.getTitlebarAreaRect() : null;
-
-                var padStart = 0;
-                var source = 'none';
-                var height = 0;
-
-                if (wco && wco.visible && rect && rect.width !== 0 && rect.x > 0) {
-                    padStart = Math.round(rect.x);
-                    height = Math.round(rect.height) || 40;
-                    source = 'wco-api';
-                } else if (LOCALE_IS_RTL) {
-                    // Fallback: WCO API unavailable or not reporting left-side controls,
-                    // but the OS locale is RTL — apply a conservative default padding.
-                    padStart = FALLBACK_PAD_PX;
-                    height = 40;
-                    source = 'locale-fallback';
-                } else {
-                    // True no-op case: LTR locale and either no API or overlay on right.
-                    window.__claudeWCOState = { source: 'none', reason: 'ltr-or-right-controls', rect: rect, locale: locale };
-                    removeAll();
-                    return true;
-                }
-
-                window.__claudeWCOState = { source: source, padStart: padStart, rect: rect, locale: locale, visible: wco ? wco.visible : null };
-
-                var topBar = findTopBar();
-                if (!topBar) return false; // Signal caller to retry later
-
-                // Clear stale markers (previous target may have unmounted), mark fresh one.
-                var prevMarked = document.querySelectorAll('[' + TARGET_ATTR + ']');
-                for (var i = 0; i < prevMarked.length; i++) {
-                    if (prevMarked[i] !== topBar) prevMarked[i].removeAttribute(TARGET_ATTR);
-                }
-                topBar.setAttribute(TARGET_ATTR, 'true');
-
-                var style = document.getElementById(STYLE_ID);
-                if (!style) {
-                    style = document.createElement('style');
-                    style.id = STYLE_ID;
-                    document.head.appendChild(style);
-                }
-                // Single rule bound to our private attribute — zero collision risk
-                // with any selector claude.ai might define.
-                style.textContent =
-                    '[' + TARGET_ATTR + ']{padding-inline-start:' + padStart +
-                    'px!important;box-sizing:border-box!important}';
-                return true;
-            } catch(e) {
-                console.error('[Claude WCO Fix]', e);
-                return true; // Error → don't spam retries
-            }
-        }
-
-        function scheduleAttempt() {
-            var ok = applyFix();
-            if (ok === false && retryCount++ < MAX_RETRIES) {
-                setTimeout(scheduleAttempt, 500);
-            }
-        }
-
-        function attach() {
-            scheduleAttempt();
-
-            // Chromium fires geometrychange on maximize/restore/DPI change.
-            if (wco && typeof wco.addEventListener === 'function') {
-                wco.addEventListener('geometrychange', function() {
-                    retryCount = 0;
-                    applyFix();
-                });
-            }
-            // In locale-fallback mode we have no geometrychange event — listen
-            // for window resize as a proxy. Cheap, fires rarely.
-            if (!wco && LOCALE_IS_RTL) {
-                window.addEventListener('resize', function() {
-                    retryCount = 0;
-                    applyFix();
-                });
-            }
-
-            // React/SPA re-renders can unmount the top bar. Re-apply when that
-            // happens. Debounced to 200ms; only actually re-runs if the marked
-            // target is no longer in the DOM.
-            var debounceTimer = null;
-            var obs = new MutationObserver(function() {
-                if (debounceTimer) return;
-                debounceTimer = setTimeout(function() {
-                    debounceTimer = null;
-                    var marked = document.querySelector('[' + TARGET_ATTR + ']');
-                    if (!marked || !document.body.contains(marked)) {
-                        retryCount = 0;
-                        applyFix();
-                    }
-                }, 200);
-            });
-            obs.observe(document.body, { childList: true, subtree: true });
-        }
-
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', attach);
-        } else {
-            attach();
-        }
-    } catch(e) { console.error('[Claude WCO Fix]', e); }
-})();
-// --- CLAUDE WCO FIX END ---
 
 // --- CLAUDE PATCH WELCOME BANNER START ---
 ;(function() {
@@ -617,6 +470,29 @@ $RTL_INJECTION_CODE = @'
     } catch(e) { console.error('[Claude Welcome Banner]', e); }
 })();
 // --- CLAUDE PATCH WELCOME BANNER END ---
+'@
+
+# Main-process snippet (NOT renderer). Unlike $RTL_INJECTION_CODE, this runs in the
+# Electron main process. It forces Chromium's UI direction to LTR, which fixes the
+# native frame-peek/preview window jumping to the far left and the title-bar control
+# placement on Hebrew/RTL OS locales. Root cause: when the OS locale is RTL, Chromium
+# derives a RTL UI direction and draws native child windows with WS_EX_LAYOUTRTL
+# (X-axis mirroring); the app itself sets no UI direction, so this switch is the
+# override. Injected at the very top of the main entry (index.pre.js), before app
+# 'ready' fires. Kept tiny and DOM-free to avoid interfering with MCP startup (#14).
+$MAIN_INJECTION_CODE = @'
+// --- CLAUDE RTL MAIN PATCH START ---
+;(function(){
+    try {
+        if (global.__claudeRtlMainPatched) return;
+        global.__claudeRtlMainPatched = true;
+        var app = require('electron').app;
+        if (app && app.commandLine && typeof app.commandLine.appendSwitch === 'function') {
+            app.commandLine.appendSwitch('force-ui-direction', 'ltr');
+        }
+    } catch (e) { try { console.error('[Claude RTL Main]', e); } catch (_) {} }
+})();
+// --- CLAUDE RTL MAIN PATCH END ---
 '@
 
 # -----------------------------------------------------------------------------
@@ -1986,14 +1862,29 @@ function Install-Patch {
 
         $BuildDir = Join-Path $global:TmpDir ".vite\build"
         if (Test-Path $BuildDir) {
-            # Files that run OUTSIDE the renderer (main process / MCP host / Node workers).
-            # They have no DOM, so the renderer-only RTL snippet is a guarded no-op there;
-            # injecting into them gives no benefit and risks interfering with MCP server
-            # startup (issue #14). index.js is the main-process bundle that SPAWNS the MCP
-            # hosts. Skip them entirely; RTL still works via the window preload scripts.
-            $SkipNonRenderer = @(
-                'index.js',                 # .vite/build/index.js         - main process entry
-                'index.pre.js',             # .vite/build/index.pre.js     - main process bootstrap
+            # Resolve the Electron main-process entry from package.json "main"
+            # (currently ".vite/build/index.pre.js"); fall back to the known filename if
+            # parsing fails. The ENTRY alone receives the tiny main-process switch
+            # injection ($MAIN_INJECTION_CODE), NOT the renderer RTL/DOM payload.
+            $MainEntryFile = 'index.pre.js'
+            $PkgJsonPath = Join-Path $global:TmpDir 'package.json'
+            if (Test-Path $PkgJsonPath) {
+                try {
+                    $pkgMain = (Get-Content $PkgJsonPath -Raw | ConvertFrom-Json).main
+                    if ($pkgMain) { $MainEntryFile = Split-Path $pkgMain -Leaf }
+                } catch { Write-Log "Could not parse package.json 'main'; defaulting entry to '$MainEntryFile'." }
+            }
+            Write-Log "Main-process entry: $MainEntryFile"
+
+            # Files that run OUTSIDE the renderer and must NOT receive the renderer-only
+            # RTL/DOM payload (no DOM; injecting risks breaking MCP startup -- issue #14).
+            # index.js is the large main bundle the entry require()s; the rest are Node
+            # MCP host/workers. All skipped entirely. The main ENTRY is handled separately
+            # below: it gets $MAIN_INJECTION_CODE (force-ui-direction=ltr), which runs
+            # before app 'ready' and fixes the native preview window jumping left and the
+            # title-bar control placement on RTL OS locales.
+            $SkipEntirely = @(
+                'index.js',                 # .vite/build/index.js         - large main-process bundle
                 'directMcpHost.js',         # .vite/build/mcp-runtime/...  - Node MCP host
                 'nodeHost.js',              # .vite/build/mcp-runtime/...  - Node host
                 'shellPathWorker.js',       # .vite/build/shell-path-worker/...
@@ -2001,22 +1892,55 @@ function Install-Patch {
             )
             $JsFiles = Get-ChildItem -Path $BuildDir -Filter "*.js" -Recurse
             $Injected = 0
+            $MainInjected = 0
+            $utf8NoBom = New-Object System.Text.UTF8Encoding $false
             foreach ($file in $JsFiles) {
-                if ($SkipNonRenderer -contains $file.Name) {
+                if ($SkipEntirely -contains $file.Name) {
                     Write-Log "Skipped non-renderer file (no DOM): $($file.Name)"
                     continue
                 }
                 $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
-                if ($content -match "CLAUDE RTL PATCH START") { continue }
 
+                if ($file.Name -eq $MainEntryFile) {
+                    # Main-process entry: inject the Chromium UI-direction switch only.
+                    # Insert AFTER the leading "use strict"; directive so the bundle keeps
+                    # strict mode -- a bare prepend would demote the directive (it must be
+                    # the first statement) and silently disable strict mode for the whole
+                    # main bundle.
+                    if ($content -match "CLAUDE RTL MAIN PATCH START") { continue }
+                    $strictRe = '^\s*("use strict"|''use strict'')\s*;'
+                    if ($content -match $strictRe) {
+                        $prologue = $matches[0]
+                        $newContent = $prologue + "`n" + $MAIN_INJECTION_CODE + "`n" + $content.Substring($prologue.Length)
+                    } else {
+                        $newContent = $MAIN_INJECTION_CODE + "`n" + $content
+                    }
+                    [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
+
+                    # Fail fast: a syntax error in the ENTRY would prevent Claude from
+                    # starting at all, and the snippet's try/catch cannot guard a parse
+                    # error. Validate the written file before committing to a repack
+                    # (Test-FileValid checks asar structure, not JS syntax).
+                    cmd.exe /c "node --check `"$($file.FullName)`""
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "node --check failed on patched main entry '$($file.Name)'. Refusing to repack -- the injected main-process snippet would prevent Claude from starting."
+                    }
+                    $MainInjected++
+                    Write-Log "Injected MAIN switch (force-ui-direction=ltr) into: $($file.Name)"
+                    continue
+                }
+
+                # Renderer file: inject the RTL/DOM payload.
+                if ($content -match "CLAUDE RTL PATCH START") { continue }
                 $newContent = $RTL_INJECTION_CODE + "`n" + $content
-                $utf8NoBom = New-Object System.Text.UTF8Encoding $false
                 [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
                 $Injected++
                 Write-Log "Injected RTL into: $($file.Name)"
             }
+            if ($MainInjected -gt 0) { Write-Success "Injected main-process UI-direction switch into $MainInjected file(s)." }
+            else { Write-Warn "Main-process entry '$MainEntryFile' not found or already patched." }
             if ($Injected -gt 0) { Write-Success "Injected RTL JS logic into $Injected file(s)." }
-            else { Write-Warn "JS files already patched or not found." }
+            else { Write-Warn "Renderer JS files already patched or not found." }
         }
 
         $TmpAsarPath = "$AsarPath.new"
