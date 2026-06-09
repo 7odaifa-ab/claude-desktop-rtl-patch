@@ -27,7 +27,7 @@ Auto-detects RTL text and aligns direction where it should, without breaking Eng
 - **Stays applied across updates** (optional), via a desktop shortcut or a background auto-updater.
 
 > [!NOTE]
-> On a Windows system whose display language is set to Hebrew/Arabic, Claude Desktop's entire window UI flips to RTL on its own. This is a pre-existing bug, not caused by the patch. It pushes the title-bar window controls (minimize / maximize / close) on top of Claude's own settings and navigation buttons, hiding them, and sends the preview ("frame-peek") window to the far left. The patch fixes this by forcing the window chrome back to LTR, without affecting the direction of the chat text itself.
+> On a Windows system whose display language is set to Hebrew/Arabic, Claude Desktop's entire window UI flips to RTL on its own. This is a pre-existing bug, not caused by the patch. It pushes the title-bar window controls (minimize / maximize / close) on top of Claude's own settings and navigation buttons, hiding them, and sends the preview window to the far left. The patch fixes this by forcing the window chrome back to LTR, without affecting the direction of the chat text itself.
 
 ---
 
@@ -66,7 +66,7 @@ When you run the script, you get an interactive menu:
 | # | Option | What it does |
 | :---: | :--- | :--- |
 | **1** | Install Smart RTL Patch | Backs up the originals and injects RTL support |
-| **2** | Restore Original State | Reverts every change and removes the certificate |
+| **2** | Restore Original State | Reverts every change the patch made |
 | **3** | Create 'Quick Update' Shortcut | Adds a desktop shortcut for one-click re-patching |
 | **4** | Enable Auto Re-Patch | Installs a background watcher that re-patches after each Claude update |
 | **5** | Disable Auto Re-Patch | Removes that background watcher |
@@ -151,15 +151,6 @@ cd claude-desktop-rtl-patch
 powershell -ExecutionPolicy Bypass -File tools\verify-signature.ps1
 ```
 
-**For maintainers:** install the pre-commit hook once with `tools\install-hooks.ps1`, and re-sign after editing `patch.ps1`:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\sign-release.ps1
-git add patch.ps1 patch.ps1.sig
-```
-
-The hook blocks any commit touching `patch.ps1`, `patch.ps1.sig`, or `install.ps1` if the signature doesn't match, so a forgotten re-sign can't reach `main`.
-
 </details>
 
 ---
@@ -167,12 +158,12 @@ The hook blocks any commit touching `patch.ps1`, `patch.ps1.sig`, or `install.ps
 ## ⚠️ Disclaimer
 
 > [!CAUTION]
-> This patch modifies Claude Desktop's binaries in ways **not authorized by Anthropic**. It replaces Anthropic's code-signing certificate inside `cowork-svc.exe` with a self-signed one, adds that certificate to your Windows **trusted root store**, and bypasses the app's integrity verification.
+> This patch modifies Claude Desktop's binaries. It replaces Anthropic's code-signing certificate inside `cowork-svc.exe` with a self-signed one, adds that certificate to your Windows **trusted root store**, and bypasses the app's integrity verification.
 
 By installing, you accept that:
 
 1. **You use it at your own risk.** The authors take no responsibility for system damage, data loss, or instability.
-2. **Anthropic may terminate your account** for unauthorized modifications, per their Terms of Service.
+2. **Modifying the app may not align with Anthropic's Terms of Service.** It's worth reviewing them and using your own judgment.
 3. **You trust this repository.** Running `irm | iex` as Administrator executes code with full privileges, so always verify the source.
 4. **It's temporary.** Claude updates overwrite the patched files, so re-run the installer (or use the auto-updater) after each update.
 5. **It's a stopgap** until Anthropic adds native RTL support. Please request that feature through official channels.
