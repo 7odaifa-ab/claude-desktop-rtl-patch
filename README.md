@@ -4,7 +4,7 @@
 
 **Proper Hebrew & Arabic (right-to-left) support for Claude Desktop on Windows.**
 
-Auto-detects RTL text and flips direction where it should — while keeping English and code blocks left-to-right.
+Auto-detects RTL text and aligns direction where it should, without breaking English or code blocks.
 
 [English](README.md) · [עברית](README.he.md)
 
@@ -20,14 +20,14 @@ Auto-detects RTL text and flips direction where it should — while keeping Engl
 
 ## ✨ What it does
 
-- **Auto-detects RTL text** in Claude's responses and the input box, and sets the correct direction in real time — even while a reply is still streaming.
-- **Keeps code blocks (and English) left-to-right** so formatting never breaks.
-- **Fixes the broken window UI on RTL systems** — see the note below.
+- **Auto-detects RTL text** in Claude's responses and the input box, and aligns the direction in real time, even while a reply is still streaming.
+- **Keeps code blocks (and English) left-to-right**, so formatting never breaks.
+- **Fixes the broken window UI on RTL systems** (see the note below).
 - **Backs up every file it touches**, with one-click restore and automatic rollback if anything goes wrong.
-- **Stays applied across updates** (optional) via a desktop shortcut or a background auto-updater.
+- **Stays applied across updates** (optional), via a desktop shortcut or a background auto-updater.
 
 > [!NOTE]
-> On a Windows system whose display language is set to Hebrew/Arabic, Claude Desktop's entire window UI flips to RTL **on its own — this is a pre-existing bug, not caused by the patch.** It pushes the title-bar window controls (minimize / maximize / close) on top of Claude's own settings and navigation buttons, hiding them, and sends the preview ("frame-peek") window to the far left. The patch **fixes** this by forcing the window chrome back to LTR, without affecting the direction of the chat text itself.
+> On a Windows system whose display language is set to Hebrew/Arabic, Claude Desktop's entire window UI flips to RTL on its own. This is a pre-existing bug, not caused by the patch. It pushes the title-bar window controls (minimize / maximize / close) on top of Claude's own settings and navigation buttons, hiding them, and sends the preview ("frame-peek") window to the far left. The patch fixes this by forcing the window chrome back to LTR, without affecting the direction of the chat text itself.
 
 ---
 
@@ -39,7 +39,7 @@ Open **Windows PowerShell** and run:
 irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1 | iex
 ```
 
-A UAC prompt will appear — click **Yes** to grant administrator privileges, then choose **1. Install** from the menu.
+A UAC prompt will appear. Click **Yes** to grant administrator privileges, then choose **1. Install** from the menu.
 
 > [!TIP]
 > Prefer not to pipe to `iex`? Download `patch.ps1` from the repo, right-click it, and choose **Run with PowerShell**.
@@ -51,11 +51,11 @@ A UAC prompt will appear — click **Yes** to grant administrator privileges, th
 | Requirement | Notes |
 | :--- | :--- |
 | **Windows 10 / 11** | With Claude Desktop installed ([download](https://downloads.claude.ai/releases/win32/ClaudeSetup.exe)) |
-| **Node.js** | `npx` must be on your PATH ([nodejs.org](https://nodejs.org/)) — used to repack the app archive |
+| **Node.js** | `npx` must be on your PATH ([nodejs.org](https://nodejs.org/)), used to repack the app archive |
 | **Administrator** | The installer elevates automatically via UAC |
 
 > [!IMPORTANT]
-> **Windows only.** On macOS, use [soguy's Mac patch](https://github.com/soguy/claude-desktop-rtl-mac) instead. *(I haven't personally tested the Mac version — use at your own risk.)*
+> **Windows only.** On macOS, use [soguy's Mac patch](https://github.com/soguy/claude-desktop-rtl-mac) instead. *(I haven't personally tested the Mac version, use at your own risk.)*
 
 ---
 
@@ -78,8 +78,8 @@ When you run the script, you get an interactive menu:
 
 Claude Desktop updates often, and each update overwrites the patch. Two optional features keep it effortless:
 
-- **Quick Update shortcut (option 3)** — a desktop shortcut named **"Update Claude RTL"**. Double-click it to silently fetch and re-apply the latest patch.
-- **Auto-updater (option 4)** — a lightweight Windows scheduled task that detects when a new `claude.exe` version launches, re-applies the patch automatically, and shows a notification when it's done.
+- **Quick Update shortcut (option 3):** a desktop shortcut named **"Update Claude RTL"**. Double-click it to silently fetch and re-apply the latest patch.
+- **Auto-updater (option 4):** a lightweight Windows scheduled task that detects when a new `claude.exe` version launches, re-applies the patch automatically, and shows a notification when it's done.
 
 ---
 
@@ -91,15 +91,15 @@ Run the script and choose **2. Restore Original State**. This restores all origi
 
 ## 🛠️ Troubleshooting
 
-**"Node.js (npx) is required"** — Install Node.js from [nodejs.org](https://nodejs.org/) and reopen PowerShell.
+**"Node.js (npx) is required":** Install Node.js from [nodejs.org](https://nodejs.org/) and reopen PowerShell.
 
-**Claude won't start after patching** — Run the script again, choose **2 (Restore)**, then **1 (Install)**.
+**Claude won't start after patching:** Run the script again, choose **2 (Restore)**, then **1 (Install)**.
 
-**Claude updated and the patch broke** — Run the "Update Claude RTL" shortcut, or use the auto-updater. To fix it manually, delete any `.bak` files in the Claude app directory and run the installer again.
+**Claude updated and the patch broke:** Run the "Update Claude RTL" shortcut, or use the auto-updater. To fix it manually, delete any `.bak` files in the Claude app directory and run the installer again.
 
-**`Import-Module … The member AuditToString is already present`** — You ran the command in **PowerShell 7 (`pwsh`)**, which has a known bug that breaks the patch. Use the built-in **Windows PowerShell** instead:
+**`Import-Module … The member AuditToString is already present`:** You ran the command in **PowerShell 7 (`pwsh`)**, which has a known bug that breaks the patch. Use the built-in **Windows PowerShell** instead:
 
-1. Press **Win + R**, type `powershell`, and press **Enter** — this opens the classic **blue** Windows PowerShell window (not the black `pwsh` one).
+1. Press **Win + R**, type `powershell`, and press **Enter**. This opens the classic **blue** Windows PowerShell window (not the black `pwsh` one).
 2. Paste the install command and run it.
 
 ---
@@ -107,13 +107,13 @@ Run the script and choose **2. Restore Original State**. This restores all origi
 <details>
 <summary><b>🔍 How it works (technical)</b></summary>
 
-Claude Desktop is a **digitally signed** Electron app, so editing its UI code breaks the integrity checks. The patch works around this in three phases — all atomic, with automatic rollback on failure:
+Claude Desktop is a **digitally signed** Electron app, so editing its UI code breaks the integrity checks. The patch works around this in three phases, all atomic, with automatic rollback on failure:
 
-**1 — ASAR injection.** Claude's UI lives inside `app.asar`. The script extracts it with `npx @electron/asar`, prepends a small RTL-detection snippet to the renderer files (and forces the window UI to LTR in the main process), repacks the archive, and computes its new SHA-256 header hash.
+**Phase 1, ASAR injection.** Claude's UI lives inside `app.asar`. The script extracts it with `npx @electron/asar`, prepends a small RTL-detection snippet to the renderer files (and forces the window UI to LTR in the main process), repacks the archive, and computes its new SHA-256 header hash.
 
-**2 — Hash replacement in `claude.exe`.** The original ASAR hash is stored as an ASCII string inside `claude.exe`. The script does a byte-level search-and-replace to update it. If the format ever changes, it falls back to disabling the Electron integrity fuse.
+**Phase 2, hash replacement in `claude.exe`.** The original ASAR hash is stored as an ASCII string inside `claude.exe`. The script does a byte-level search-and-replace to update it. If the format ever changes, it falls back to disabling the Electron integrity fuse.
 
-**3 — Certificate swap in `cowork-svc.exe`.** This service verifies `claude.exe` against Anthropic's embedded certificate. The script locates that certificate (by pattern-matching around the `"Anthropic, PBC"` string), replaces it in-place with a self-signed one (padded with `0x00` to keep the file size), re-signs both binaries, adds the new certificate to the Windows trusted root store, and then **wipes the private key**.
+**Phase 3, certificate swap in `cowork-svc.exe`.** This service verifies `claude.exe` against Anthropic's embedded certificate. The script locates that certificate (by pattern-matching around the `"Anthropic, PBC"` string), replaces it in-place with a self-signed one (padded with `0x00` to keep the file size), re-signs both binaries, adds the new certificate to the Windows trusted root store, and then wipes the private key.
 
 All original files are backed up as `.bak` next to the originals before anything changes.
 
@@ -122,7 +122,7 @@ All original files are backed up as `.bak` next to the originals before anything
 <details>
 <summary><b>🔐 Security & verification</b></summary>
 
-`install.ps1` verifies an **RSA-4096 signature** over `patch.ps1` before running it. A compromised GitHub repo alone is **not** enough to ship malicious code — the attacker would also need the maintainer's offline private key.
+`install.ps1` verifies an **RSA-4096 signature** over `patch.ps1` before running it. A compromised GitHub repo alone is **not** enough to ship malicious code; the attacker would also need the maintainer's offline private key.
 
 **Public-key fingerprint (SHA-256):**
 
@@ -130,7 +130,7 @@ All original files are backed up as `.bak` next to the originals before anything
 6e:f4:c2:a6:c2:42:34:a1:5f:e5:cd:e5:5d:a5:b0:3c:94:64:b4:56:7f:81:04:7c:83:9a:50:1c:7c:6f:07:c9
 ```
 
-Recompute the fingerprint of the key embedded in `install.ps1` and check it matches:
+To double-check, recompute the fingerprint of the key embedded in `install.ps1` and confirm it matches:
 
 ```powershell
 $content = Invoke-RestMethod "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/install.ps1"
@@ -141,7 +141,7 @@ if ($content -match "ExpectedPubKey\s*=\s*'([A-Za-z0-9+/=]+)'") {
 }
 ```
 
-A mismatch means the embedded key was swapped — **do not proceed**; report it as a security issue.
+A mismatch means the embedded key was swapped. **Do not proceed**, and report it as a security issue.
 
 To audit a release without installing:
 
@@ -173,15 +173,15 @@ By installing, you accept that:
 
 1. **You use it at your own risk.** The authors take no responsibility for system damage, data loss, or instability.
 2. **Anthropic may terminate your account** for unauthorized modifications, per their Terms of Service.
-3. **You trust this repository.** Running `irm | iex` as Administrator executes code with full privileges — always verify the source.
-4. **It's temporary.** Claude updates overwrite the patched files; re-run the installer (or use the auto-updater) after each update.
+3. **You trust this repository.** Running `irm | iex` as Administrator executes code with full privileges, so always verify the source.
+4. **It's temporary.** Claude updates overwrite the patched files, so re-run the installer (or use the auto-updater) after each update.
 5. **It's a stopgap** until Anthropic adds native RTL support. Please request that feature through official channels.
 
 ---
 
 ## 🤝 Contributing
 
-This project is open source under the **MIT** license. Contributions that improve RTL accuracy are very welcome — PRs are open. 🙏
+This project is open source under the **MIT** license. Contributions that improve RTL accuracy are very welcome, and PRs are open. 🙏
 
 ## License
 
