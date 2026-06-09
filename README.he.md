@@ -71,8 +71,8 @@ irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/in
 | **1** | Install Smart RTL Patch | מגבה את הקבצים המקוריים ומזריק את תמיכת ה-RTL |
 | **2** | Restore Original State | מבטל את כל השינויים ומסיר את התעודה |
 | **3** | Create 'Quick Update' Shortcut | מוסיף קיצור דרך לשולחן העבודה להחלת הפאצ' מחדש בלחיצה |
-| **4** | Enable Auto Re-Patch | מתקין רכיב רקע שמחיל את הפאצ' מחדש אחרי כל עדכון של Claude |
-| **5** | Disable Auto Re-Patch | מסיר את רכיב הרקע הזה |
+| **4** | Enable Auto Re-Patch | מפעיל עדכון אוטומטי שמחיל את הפאצ' מחדש אחרי כל עדכון של Claude |
+| **5** | Disable Auto Re-Patch | מכבה את העדכון האוטומטי |
 | **6** | Exit | סוגר את המתקין |
 
 ---
