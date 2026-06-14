@@ -1,0 +1,11 @@
+{
+  "name": "claude-desktop-rtl-patch",
+  "version": "1.0.0",
+  "description": "RTL (Hebrew/Arabic) + math/table support patch for Claude Desktop on Windows. JS detection core, unit-tested and built into patch.ps1.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "build": "powershell -NoProfile -ExecutionPolicy Bypass -File tools/build-payload.ps1"
+  }
+}

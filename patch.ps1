@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Claude Desktop Smart RTL Patcher & Service Fixer
 .DESCRIPTION
@@ -81,29 +81,173 @@ $RTL_INJECTION_CODE = @'
     try {
         var WRITING_SEL = '[data-testid="chat-input"]';
 
-        function isRTL(c) {
-            var code = c.charCodeAt(0);
-            return (code >= 0x0590 && code <= 0x05FF) ||
-                   (code >= 0x0600 && code <= 0x06FF) ||
-                   (code >= 0x0750 && code <= 0x077F) ||
-                   (code >= 0x08A0 && code <= 0x08FF);
-        }
+        // --- PURE DETECTION CORE (inlined from src/rtl-core.js by build-payload.ps1) ---
+        // rtl-core.js -- pure, DOM-free RTL/LaTeX detection logic.
+//
+// SOURCE OF TRUTH for the detection engine. tools/build-payload.ps1 inlines the
+// function bodies of this file into the injected IIFE inside patch.ps1 (it strips
+// the module.exports guard at the bottom). test/rtl-core.test.js requires this
+// file directly. Keep this file DOM-free so it stays unit-testable.
+'use strict';
 
-        function hasRTL(text) {
-            if (!text) return false;
-            for (var i = 0; i < text.length; i++) { if (isRTL(text[i])) return true; }
-            return false;
-        }
+// Strong-RTL code-point ranges, [lo, hi] inclusive. Covers the modern living
+// RTL scripts plus the common historic/astral ones. Tested against code points
+// (codePointAt), NOT UTF-16 code units, so astral blocks like Adlam work.
+var RTL_RANGES = [
+    [0x0590, 0x05FF], // Hebrew
+    [0x0600, 0x06FF], // Arabic
+    [0x0700, 0x074F], // Syriac
+    [0x0750, 0x077F], // Arabic Supplement
+    [0x0780, 0x07BF], // Thaana
+    [0x07C0, 0x07FF], // NKo
+    [0x0800, 0x083F], // Samaritan
+    [0x0840, 0x085F], // Mandaic
+    [0x0860, 0x086F], // Syriac Supplement
+    [0x0870, 0x089F], // Arabic Extended-B
+    [0x08A0, 0x08FF], // Arabic Extended-A
+    [0xFB1D, 0xFB4F], // Hebrew presentation forms
+    [0xFB50, 0xFDFF], // Arabic presentation forms-A
+    [0xFE70, 0xFEFF], // Arabic presentation forms-B
+    [0x10800, 0x1083F], // Cypriot Syllabary block (incl. early RTL scripts)
+    [0x10840, 0x1085F], // Imperial Aramaic
+    [0x10A00, 0x10A5F], // Kharoshthi
+    [0x10E60, 0x10E7F], // Rumi Numeral Symbols
+    [0x1E800, 0x1E8DF], // Mende Kikakui
+    [0x1E900, 0x1E95F], // Adlam
+    [0x1EE00, 0x1EEFF]  // Arabic Mathematical Alphabetic Symbols
+];
 
-        // First strong character direction in a string
-        function firstStrong(text) {
-            if (!text) return null;
-            for (var i = 0; i < text.length; i++) {
-                if (isRTL(text[i])) return 'rtl';
-                if (/[a-zA-Z]/.test(text[i])) return 'ltr';
+// cp: a Unicode code point (from String.prototype.codePointAt).
+function isRTL(cp) {
+    for (var i = 0; i < RTL_RANGES.length; i++) {
+        if (cp >= RTL_RANGES[i][0] && cp <= RTL_RANGES[i][1]) return true;
+    }
+    return false;
+}
+
+function hasRTL(text) {
+    if (!text) return false;
+    for (var i = 0; i < text.length;) {
+        var cp = text.codePointAt(i);
+        if (isRTL(cp)) return true;
+        i += cp > 0xFFFF ? 2 : 1;
+    }
+    return false;
+}
+
+// Direction of the first strong character: 'rtl', 'ltr', or null (no strong char).
+function firstStrong(text) {
+    if (!text) return null;
+    for (var i = 0; i < text.length;) {
+        var cp = text.codePointAt(i);
+        if (isRTL(cp)) return 'rtl';
+        // ASCII Latin letters are strong-LTR (matches the original /[a-zA-Z]/ rule).
+        if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) return 'ltr';
+        i += cp > 0xFFFF ? 2 : 1;
+    }
+    return null;
+}
+
+// Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a
+// Hebrew sentence that starts with "foo.js" still detects as RTL.
+function stripLeadingLTR(text) {
+    return text
+        .replace(/^[\s]*(?:[\w.\-]+\.[\w]{1,5})\s*/g, '')
+        .replace(/https?:\/\/\S+/g, '')
+        .replace(/[\w.\-]+[\/\\][\w.\-\/\\]+/g, '')
+        .replace(/`[^`]+`/g, '');
+}
+
+// A "$...$" body is treated as math only when it carries a real LaTeX signal.
+// This is the currency guard: "$5.99" or "$5 to $10" lack the signal and stay text.
+var LATEX_SIGNAL = /[\\^_{}]|\b(?:frac|sqrt|sum|prod|int|lim|infty|cdot|times|div|leq|geq|neq|approx|partial|nabla|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|omega|matrix|begin|end|left|right|text|mathbb|mathcal|vec|hat|bar|overline|underline)\b/;
+
+function hasLatexSignal(body) {
+    return LATEX_SIGNAL.test(body);
+}
+
+// Find math regions as [start, end) index pairs over `text`.
+// Unambiguous delimiters ($$...$$, \[...\], \(...\)) always count; single $...$
+// only counts with a LaTeX signal and only outside already-claimed regions.
+function findLatexRanges(text) {
+    var ranges = [];
+    if (!text) return ranges;
+
+    function claim(re, requireSignal, bodyStart, bodyEnd) {
+        var m;
+        re.lastIndex = 0;
+        while ((m = re.exec(text)) !== null) {
+            var start = m.index;
+            var end = m.index + m[0].length;
+            if (overlaps(start, end)) continue;
+            if (requireSignal) {
+                var body = m[0].slice(bodyStart, m[0].length - bodyEnd);
+                if (!hasLatexSignal(body)) continue;
             }
-            return null;
+            ranges.push([start, end]);
         }
+    }
+    function overlaps(s, e) {
+        for (var i = 0; i < ranges.length; i++) {
+            if (s < ranges[i][1] && e > ranges[i][0]) return true;
+        }
+        return false;
+    }
+
+    // Order matters: claim the unambiguous, greedier delimiters first.
+    claim(/\$\$[\s\S]+?\$\$/g, false, 0, 0);
+    claim(/\\\[[\s\S]+?\\\]/g, false, 0, 0);
+    claim(/\\\([\s\S]+?\\\)/g, false, 0, 0);
+    // Single $...$ -- no newline inside, must carry a LaTeX signal (currency guard).
+    claim(/\$[^$\n]+?\$/g, true, 1, 1);
+
+    ranges.sort(function (a, b) { return a[0] - b[0]; });
+    return ranges;
+}
+
+// Split text into alternating {type:'text'|'math', value} segments.
+function segmentText(text) {
+    var segs = [];
+    if (!text) return segs;
+    var ranges = findLatexRanges(text);
+    if (!ranges.length) {
+        segs.push({ type: 'text', value: text });
+        return segs;
+    }
+    var pos = 0;
+    for (var i = 0; i < ranges.length; i++) {
+        if (ranges[i][0] > pos) {
+            segs.push({ type: 'text', value: text.slice(pos, ranges[i][0]) });
+        }
+        segs.push({ type: 'math', value: text.slice(ranges[i][0], ranges[i][1]) });
+        pos = ranges[i][1];
+    }
+    if (pos < text.length) segs.push({ type: 'text', value: text.slice(pos) });
+    return segs;
+}
+
+// Decide a whole table's column direction from header / first-column cell dirs.
+// Each input is an array of 'rtl' | 'ltr' | null. Header wins; first column is
+// the tie-breaker. Returns 'rtl' (flip columns) or null (leave LTR).
+function tableDirFromCells(headerDirs, firstColDirs) {
+    var h = majorityDir(headerDirs || []);
+    if (h === 'rtl') return 'rtl';
+    if (h === 'ltr') return null;
+    var c = majorityDir(firstColDirs || []);
+    return c === 'rtl' ? 'rtl' : null;
+}
+
+function majorityDir(dirs) {
+    var r = 0, l = 0;
+    for (var i = 0; i < dirs.length; i++) {
+        if (dirs[i] === 'rtl') r++;
+        else if (dirs[i] === 'ltr') l++;
+    }
+    if (r > l) return 'rtl';
+    if (l > r) return 'ltr';
+    return null;
+}
+        // --- END PURE DETECTION CORE ---
 
         // Get text from element excluding <code> children (DOM-aware)
         function textWithoutCode(el) {
@@ -119,23 +263,12 @@ $RTL_INJECTION_CODE = @'
             return out;
         }
 
-        // Strip leading LTR-only patterns from plain text
-        // Removes: filenames (x.js), URLs, paths (a/b/c), backtick-code
-        function stripLeadingLTR(text) {
-            return text
-                .replace(/^[\s]*(?:[\w.\-]+\.[\w]{1,5})\s*/g, '')
-                .replace(/https?:\/\/\S+/g, '')
-                .replace(/[\w.\-]+[\/\\][\w.\-\/\\]+/g, '')
-                .replace(/`[^`]+`/g, '');
-        }
-
         // --- PER-LINE DIRECTIONAL SPLITTING ---
         //
         // A paragraph rendered with <br> separators or whitespace-pre may carry
         // multiple lines, each in a different script. Forcing a single dir on the
-        // host element mangles every line that disagrees. We instead wrap each
-        // line in its own dir-tagged span and stamp data-rtl-split on the host so
-        // subsequent passes recognize it as already handled.
+        // host element mangles every line that disagrees. We instead defer to
+        // unicode-bidi:plaintext and stamp data-rtl-split so later passes skip it.
 
         var RTL_SPLIT_FLAG = 'data-rtl-split';
         var BR_OR_NL_SPLIT = /(<br\s*\/?>|\n)/i;
@@ -145,21 +278,15 @@ $RTL_INJECTION_CODE = @'
             if (!src) return false;
             if (!/[a-zA-Z]{2,}/.test(src)) return false;
             if (!hasRTL(src)) return false;
-            // A break must appear in markup or in the rendered text.
             return BR_OR_NL_SPLIT.test(el.innerHTML) || src.indexOf('\n') !== -1;
         }
 
         function splitToDirectionalSpans(el) {
             if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
-            // No DOM rewriting — the previous version assigned to el.innerHTML which
-            // broke React reconciliation ("Failed to execute 'removeChild' on 'Node'":
-            // React tried to remove children whose identity we had just replaced).
-            //
-            // Instead, defer to unicode-bidi:plaintext. The CSS injected below already
-            // applies plaintext to :not([dir]) elements, and <br> is a paragraph
-            // separator in the Unicode BiDi algorithm — so each line auto-picks its
-            // direction from first-strong character without us touching the DOM.
-            // We mark the flag so processContainers won't try to handle the subtree.
+            // No DOM rewriting -- assigning el.innerHTML broke React reconciliation
+            // ("Failed to execute 'removeChild' on 'Node'"). Defer to
+            // unicode-bidi:plaintext: <br> is a paragraph separator in the Unicode
+            // BiDi algorithm, so each line auto-picks its direction from first-strong.
             el.setAttribute(RTL_SPLIT_FLAG, '1');
             if (el.hasAttribute('dir')) el.removeAttribute('dir');
             el.style.direction = '';
@@ -167,9 +294,8 @@ $RTL_INJECTION_CODE = @'
             el.style.unicodeBidi = 'plaintext';
         }
 
-        // Used by the no-RTL branches below: if the element inherits RTL purely
-        // via CSS class on a parent (rather than an explicit dir attribute on
-        // itself), removing dir alone won't free it — we must pin direction=ltr.
+        // If the element inherits RTL via a parent CSS class (not an explicit dir
+        // attribute on itself), removing dir alone won't free it -- pin direction=ltr.
         function resetDirOrPinLTR(el) {
             if (window.getComputedStyle(el).direction === 'rtl') {
                 el.dir = 'ltr';
@@ -197,8 +323,7 @@ $RTL_INJECTION_CODE = @'
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 3: there ARE RTL chars (we checked above) but they hide
-            // behind code/filenames. Since RTL exists, treat as RTL.
+            // Layer 3: RTL chars exist but hide behind code/filenames -> treat as RTL.
             return 'rtl';
         }
 
@@ -209,12 +334,10 @@ $RTL_INJECTION_CODE = @'
             if (d === 'rtl') return 'rtl';
             if (!hasRTL(text)) return 'ltr';
 
-            // Has RTL but first-strong is LTR — strip patterns and retry
             var stripped = stripLeadingLTR(text);
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            // RTL chars exist somewhere → RTL
             return 'rtl';
         }
 
@@ -235,6 +358,93 @@ $RTL_INJECTION_CODE = @'
             qsa(root, 'code').forEach(function(c) {
                 if (!c.closest('pre') && !c.closest('.code-block__code')) c.dir = 'ltr';
             });
+            // Rendered math (KaTeX/MathJax), if present, is an LTR island too.
+            qsa(root, '.katex, .katex-display, mjx-container').forEach(function(m) {
+                m.style.unicodeBidi = 'isolate'; m.style.direction = 'ltr';
+            });
+        }
+
+        // --- RAW LaTeX ISOLATION ---
+        //
+        // Claude Desktop (Windows) does not render LaTeX -- it shows raw "$...$" text.
+        // Inside an RTL paragraph the neutral $ \ { } chars scramble the formula. We
+        // isolate each math segment in its own ltr/unicode-bidi:isolate span. We
+        // replace a single TEXT node with a fragment (replaceChild) -- never innerHTML
+        // -- to stay gentle on React reconciliation, and flag islands so we never
+        // re-wrap during streaming.
+        var ISLAND_FLAG = 'data-rtl-island';
+
+        function isolateMath(root) {
+            if (typeof document.createTreeWalker !== 'function') return;
+            var host = (root && root.nodeType === 1) ? root : document.body;
+            if (!host) return;
+            var walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, {
+                acceptNode: function(node) {
+                    var v = node.nodeValue;
+                    if (!v || (v.indexOf('$') === -1 && v.indexOf('\\') === -1)) return NodeFilter.FILTER_REJECT;
+                    var p = node.parentElement;
+                    if (!p) return NodeFilter.FILTER_REJECT;
+                    if (p.tagName === 'SCRIPT' || p.tagName === 'STYLE') return NodeFilter.FILTER_REJECT;
+                    if (p.closest('pre, code, .code-block__code, [' + ISLAND_FLAG + '], ' + WRITING_SEL)) return NodeFilter.FILTER_REJECT;
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            });
+            // Collect first -- mutating during the walk invalidates the walker.
+            var targets = [];
+            var n;
+            while ((n = walker.nextNode())) targets.push(n);
+            targets.forEach(function(textNode) {
+                var segs = segmentText(textNode.nodeValue);
+                var hasMath = segs.some(function(s) { return s.type === 'math'; });
+                if (!hasMath) return;
+                var frag = document.createDocumentFragment();
+                segs.forEach(function(s) {
+                    if (s.type === 'math') {
+                        var span = document.createElement('span');
+                        span.setAttribute(ISLAND_FLAG, '1');
+                        span.style.unicodeBidi = 'isolate';
+                        span.style.direction = 'ltr';
+                        span.textContent = s.value;
+                        frag.appendChild(span);
+                    } else {
+                        frag.appendChild(document.createTextNode(s.value));
+                    }
+                });
+                if (textNode.parentNode) textNode.parentNode.replaceChild(frag, textNode);
+            });
+        }
+
+        // --- TABLE COLUMN ORDERING ---
+        //
+        // A Hebrew table should read right-to-left: the first column on the right.
+        // Per-cell direction is handled by processText; here we only flip the whole
+        // table's column order via dir="rtl" on a stable <table> element (no text
+        // surgery, low risk). Only flip once we are confident it is a Hebrew table;
+        // leave the flag off otherwise so a table still streaming can re-evaluate.
+        var TABLE_FLAG = 'data-rtl-table';
+
+        function processTables(root) {
+            qsa(root, 'table').forEach(function(t) {
+                if (t.getAttribute(TABLE_FLAG) === 'rtl') return;
+                if (t.closest(WRITING_SEL)) return;
+                var headerCells = Array.from(t.querySelectorAll('thead th'));
+                if (!headerCells.length) {
+                    var firstRow = t.querySelector('tr');
+                    if (firstRow) headerCells = Array.from(firstRow.querySelectorAll('th, td'));
+                }
+                var headerDirs = headerCells.map(function(c) { return firstStrong(c.textContent || ''); });
+                var rows = Array.from(t.querySelectorAll('tbody tr'));
+                if (!rows.length) rows = Array.from(t.querySelectorAll('tr')).slice(1);
+                var firstColDirs = rows.map(function(r) {
+                    var cell = r.querySelector('th, td');
+                    return cell ? firstStrong(cell.textContent || '') : null;
+                });
+                if (tableDirFromCells(headerDirs, firstColDirs) === 'rtl') {
+                    t.setAttribute(TABLE_FLAG, 'rtl');
+                    t.dir = 'rtl';
+                    t.style.direction = 'rtl';
+                }
+            });
         }
 
         function processText(root) {
@@ -244,9 +454,6 @@ $RTL_INJECTION_CODE = @'
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 var dir = detectElDir(el);
                 if (dir) {
-                    // RTL paragraphs with internal line breaks need per-line
-                    // treatment — otherwise a single English line buried in
-                    // Hebrew text inherits the wrong direction.
                     if (dir === 'rtl' && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                         return;
@@ -255,7 +462,6 @@ $RTL_INJECTION_CODE = @'
                     el.style.direction = dir;
                     if (el.tagName === 'LI') {
                         el.style.listStylePosition = (dir === 'rtl') ? 'inside' : '';
-                        // Propagate RTL to parent list immediately to fix bullet position
                         var parentList = el.closest('ul, ol');
                         if (parentList && dir === 'rtl' && !parentList.hasAttribute('dir')) {
                             parentList.dir = 'rtl';
@@ -290,13 +496,11 @@ $RTL_INJECTION_CODE = @'
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
                 if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL)) return;
-                // Bail if we (or our wrapping host) already converted this subtree into per-line spans.
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
+                if (el.hasAttribute(ISLAND_FLAG)) return;
                 var parent = el.parentElement;
                 if (parent && parent.hasAttribute(RTL_SPLIT_FLAG)) return;
-                // Skip if has block children (not a leaf)
                 if (el.querySelector('p, div, ul, ol, h1, h2, h3, h4, h5, h6, pre, table')) return;
-                // Skip elements already handled by processText
                 if (/^(P|LI|H[1-6]|BLOCKQUOTE|TD|TH|UL|OL)$/.test(el.tagName)) return;
                 var text = (el.textContent || '').trim();
                 if (text.length < 2) return;
@@ -327,8 +531,10 @@ $RTL_INJECTION_CODE = @'
         }
 
         function processAll() {
+            isolateMath(document.body);
             processText(document);
             processContainers(document.body);
+            processTables(document.body);
             processInput();
             forceCodeLTR(document.body);
         }
@@ -341,11 +547,14 @@ $RTL_INJECTION_CODE = @'
                 'p:not([dir]),li:not([dir]),h1:not([dir]),h2:not([dir]),h3:not([dir]),h4:not([dir]),h5:not([dir]),h6:not([dir]),blockquote:not([dir]),td:not([dir]),th:not([dir]),summary:not([dir]),label:not([dir]),legend:not([dir]),dt:not([dir]),dd:not([dir]),figcaption:not([dir]),caption:not([dir]){unicode-bidi:plaintext!important;text-align:start!important}',
                 'pre,.code-block__code,.relative.group\\/copy{unicode-bidi:embed!important;direction:ltr!important;text-align:left!important}',
                 'code{unicode-bidi:isolate!important;direction:ltr!important}',
+                // Raw LaTeX islands and rendered math are isolated LTR units.
+                '[data-rtl-island]{unicode-bidi:isolate!important;direction:ltr!important}',
+                '.katex,.katex-display,mjx-container{unicode-bidi:isolate!important;direction:ltr!important}',
+                // Hebrew tables: flip column order; cells keep their own direction.
+                'table[dir="rtl"]{direction:rtl!important}',
                 '[dir]{text-align:start!important}[dir="rtl"]{direction:rtl!important}[dir="ltr"]{direction:ltr!important}',
                 '[dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}',
-                // RTL: flip sidebar truncation gradient to fade the LEFT edge
-                // (Tailwind classes like [mask-image:linear-gradient(to_right,...)] cut off
-                // the start of Hebrew text instead of the end — see issue #7).
+                // RTL: flip sidebar truncation gradient to fade the LEFT edge (issue #7).
                 '[dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important}',
                 '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}'
             ].join('');
@@ -369,7 +578,7 @@ $RTL_INJECTION_CODE = @'
                 }
             }, true);
 
-            // Watch DOM changes (throttle, not debounce — process DURING streaming)
+            // Watch DOM changes (throttle, not debounce -- process DURING streaming)
             var pendingMuts = [];
             var obs = new MutationObserver(function(muts) {
                 var dominated = false;
@@ -388,7 +597,6 @@ $RTL_INJECTION_CODE = @'
                         m.addedNodes.forEach(function(n) { if (n.nodeType === 1) roots.add(n); });
                         if (m.type === 'characterData' && m.target.parentElement) roots.add(m.target.parentElement);
                     });
-                    // Expand roots to include ancestor text/list elements
                     var expanded = new Set(roots);
                     roots.forEach(function(r) {
                         if (!r.closest) return;
@@ -396,12 +604,16 @@ $RTL_INJECTION_CODE = @'
                         if (txt) expanded.add(txt);
                         var list = r.closest('ul, ol');
                         if (list) expanded.add(list);
+                        var tbl = r.closest('table');
+                        if (tbl) expanded.add(tbl);
                     });
                     roots = expanded;
                     if (roots.size > 0 && roots.size <= 30) {
                         roots.forEach(function(r) {
+                            isolateMath(r);
                             processText(r);
                             processContainers(r);
+                            processTables(r);
                             forceCodeLTR(r);
                         });
                         processInput();
