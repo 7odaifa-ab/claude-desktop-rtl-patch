@@ -21,10 +21,7 @@ Auto-detects RTL text and aligns direction where it should, without breaking Eng
 ## ✨ What it does
 
 - **Auto-detects RTL text** in Claude's responses and the input box, and aligns the direction in real time, even while a reply is still streaming.
-- **Keeps code blocks (and English) left-to-right**, so formatting never breaks.
-- **Isolates math formulas** (`$x^2$`, `$$\frac{a}{b}$$`, `\[...\]`) so LaTeX renders left-to-right inside Hebrew text instead of getting scrambled. A bare `$` price (`$5.99`) is left alone, not mistaken for a formula.
-- **Reorders Hebrew tables right-to-left** so the first column sits on the right, while each cell keeps its own direction (Hebrew cells RTL, English cells LTR).
-- **Covers more scripts** — Hebrew, Arabic, Persian, Syriac, Thaana, N'Ko, Adlam and more.
+- **Handles code, math formulas, and tables** — code blocks and LaTeX (`$x^2$`, `$$…$$`) stay left-to-right inside Hebrew, and Hebrew tables read right-to-left.
 - **Fixes the broken window UI on RTL systems** (see the note below).
 - **Backs up every file it touches**, with one-click restore and automatic rollback if anything goes wrong.
 - **Stays applied across updates** (optional), via a desktop shortcut or a background auto-updater.
@@ -177,15 +174,7 @@ By installing, you accept that:
 
 This project is open source under the **MIT** license. Contributions that improve RTL accuracy are very welcome, and PRs are open. 🙏
 
-**Working on the detection engine?** The injected JavaScript is built from `src/`, not edited inside `patch.ps1` directly:
-
-```powershell
-node --test                                   # unit-test src/rtl-core.js
-powershell -File tools\build-payload.ps1      # assemble src/ into patch.ps1
-powershell -File tools\sign-release.ps1       # re-sign (maintainer key required)
-```
-
-Editing `patch.ps1`'s payload by hand will be overwritten on the next build, and any change to `patch.ps1` must be re-signed or `install.ps1` will reject it.
+The math-formula isolation approach is credited to [Claude-UniMath](https://github.com/DavidiBellaire/Claude-UniMath) by Davidi Bellaire.
 
 ## License
 
