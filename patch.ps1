@@ -226,6 +226,17 @@ function segmentText(text) {
     return segs;
 }
 
+// Classify a table cell's direction from its text. A cell counts as RTL if it
+// *contains* any RTL character -- not merely if its first strong char is RTL.
+// Header labels often start with a Latin term ("blob ...", "ID ...") yet belong
+// to a Hebrew column, so first-strong is too weak here. Neutral cells (digits,
+// hashes, punctuation only) return null so they do not sway the majority.
+function cellDir(text) {
+    if (hasRTL(text)) return 'rtl';
+    if (firstStrong(text) === 'ltr') return 'ltr';
+    return null;
+}
+
 // Decide a whole table's column direction from header / first-column cell dirs.
 // Each input is an array of 'rtl' | 'ltr' | null. Header wins; first column is
 // the tie-breaker. Returns 'rtl' (flip columns) or null (leave LTR).
@@ -432,12 +443,12 @@ function majorityDir(dirs) {
                     var firstRow = t.querySelector('tr');
                     if (firstRow) headerCells = Array.from(firstRow.querySelectorAll('th, td'));
                 }
-                var headerDirs = headerCells.map(function(c) { return firstStrong(c.textContent || ''); });
+                var headerDirs = headerCells.map(function(c) { return cellDir(c.textContent || ''); });
                 var rows = Array.from(t.querySelectorAll('tbody tr'));
                 if (!rows.length) rows = Array.from(t.querySelectorAll('tr')).slice(1);
                 var firstColDirs = rows.map(function(r) {
                     var cell = r.querySelector('th, td');
-                    return cell ? firstStrong(cell.textContent || '') : null;
+                    return cell ? cellDir(cell.textContent || '') : null;
                 });
                 if (tableDirFromCells(headerDirs, firstColDirs) === 'rtl') {
                     t.setAttribute(TABLE_FLAG, 'rtl');

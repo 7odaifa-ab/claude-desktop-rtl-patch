@@ -66,10 +66,32 @@ test('segmentText with no math returns single text segment', () => {
     assert.strictEqual(segs[0].type, 'text');
 });
 
+test('cellDir: contains-RTL beats first-strong (header starting with Latin term)', () => {
+    assert.strictEqual(core.cellDir('blob מקומי (HEAD c16c988)'), 'rtl'); // Latin-first but Hebrew column
+    assert.strictEqual(core.cellDir('blob מה-CDN'), 'rtl');
+    assert.strictEqual(core.cellDir('קובץ'), 'rtl');
+    assert.strictEqual(core.cellDir('patch.ps1'), 'ltr');
+    assert.strictEqual(core.cellDir('9f954eb'), 'ltr');  // hex still has Latin letters (f,e,b)
+    assert.strictEqual(core.cellDir('123.45'), null);    // truly neutral: no letters, no sway
+});
+
 test('tableDirFromCells: header majority RTL → rtl', () => {
     // The example from the discussion: עברית | English | תעתיק
     const headers = [core.firstStrong('עברית'), core.firstStrong('English'), core.firstStrong('תעתיק')];
     assert.strictEqual(core.tableDirFromCells(headers, []), 'rtl');
+});
+
+test('table with Latin-first Hebrew headers flips (regression: CDN comparison table)', () => {
+    // Real case that previously failed: headers contain Hebrew but two start with "blob".
+    const headers = ['קובץ', 'blob מקומי (HEAD c16c988)', 'blob מה-CDN', 'תוצאה'].map(core.cellDir);
+    const firstCol = ['patch.ps1', 'patch.ps1.sig'].map(core.cellDir); // Latin first column
+    assert.deepStrictEqual(headers, ['rtl', 'rtl', 'rtl', 'rtl']);
+    assert.strictEqual(core.tableDirFromCells(headers, firstCol), 'rtl');
+});
+
+test('mostly-English table does NOT flip even with one Hebrew header', () => {
+    const headers = ['Name', 'Value', 'שם'].map(core.cellDir);
+    assert.strictEqual(core.tableDirFromCells(headers, []), null);
 });
 
 test('tableDirFromCells: header majority LTR → null (no flip)', () => {

@@ -142,6 +142,17 @@ function segmentText(text) {
     return segs;
 }
 
+// Classify a table cell's direction from its text. A cell counts as RTL if it
+// *contains* any RTL character -- not merely if its first strong char is RTL.
+// Header labels often start with a Latin term ("blob ...", "ID ...") yet belong
+// to a Hebrew column, so first-strong is too weak here. Neutral cells (digits,
+// hashes, punctuation only) return null so they do not sway the majority.
+function cellDir(text) {
+    if (hasRTL(text)) return 'rtl';
+    if (firstStrong(text) === 'ltr') return 'ltr';
+    return null;
+}
+
 // Decide a whole table's column direction from header / first-column cell dirs.
 // Each input is an array of 'rtl' | 'ltr' | null. Header wins; first column is
 // the tie-breaker. Returns 'rtl' (flip columns) or null (leave LTR).
@@ -175,6 +186,7 @@ if (typeof module !== 'undefined' && module.exports) {
         hasLatexSignal: hasLatexSignal,
         findLatexRanges: findLatexRanges,
         segmentText: segmentText,
+        cellDir: cellDir,
         tableDirFromCells: tableDirFromCells,
         majorityDir: majorityDir
     };

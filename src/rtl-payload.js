@@ -191,12 +191,12 @@
                     var firstRow = t.querySelector('tr');
                     if (firstRow) headerCells = Array.from(firstRow.querySelectorAll('th, td'));
                 }
-                var headerDirs = headerCells.map(function(c) { return firstStrong(c.textContent || ''); });
+                var headerDirs = headerCells.map(function(c) { return cellDir(c.textContent || ''); });
                 var rows = Array.from(t.querySelectorAll('tbody tr'));
                 if (!rows.length) rows = Array.from(t.querySelectorAll('tr')).slice(1);
                 var firstColDirs = rows.map(function(r) {
                     var cell = r.querySelector('th, td');
-                    return cell ? firstStrong(cell.textContent || '') : null;
+                    return cell ? cellDir(cell.textContent || '') : null;
                 });
                 if (tableDirFromCells(headerDirs, firstColDirs) === 'rtl') {
                     t.setAttribute(TABLE_FLAG, 'rtl');
