@@ -2221,43 +2221,66 @@ function Install-Patch {
 
             Write-Log "Target cowork-svc hole found at $([Convert]::ToString($StartPos, 16)) (Size: $OldCertSize bytes)."
 
-            # Clone the original cert Subject so the replacement blends into the binary's existing metadata.
+            # Log the original cert Subject for diagnostics, but DON'T clone it into the
+            # replacement: the Anthropic subject carries SERIALNUMBER + jurisdiction OID
+            # fields that alone push the DER cert to ~1136 bytes. We pin a compact subject
+            # instead so subject length can never blow the binary hole. The subject is
+            # cosmetic anyway -- trust comes from the Root-store entry added below, not the
+            # subject text.
             $OriginalSig = Get-AuthenticodeSignature -FilePath $SourceExe
-            $CertSubject = "CN=Claude-RTL-Patcher"
             if ($OriginalSig -and $OriginalSig.SignerCertificate) {
-                $CertSubject = $OriginalSig.SignerCertificate.Subject
-                Write-Log "Cloning original certificate subject: $CertSubject"
+                Write-Log "Original certificate subject (for reference): $($OriginalSig.SignerCertificate.Subject)"
             }
+            $CertSubject = "CN=Anthropic PBC, O=Anthropic PBC, L=San Francisco, S=California, C=US"
+            Write-Log "Using compact subject for binary fit: $CertSubject"
+
+            # The replacement cert must fit the fixed-size hole left by the original
+            # Anthropic cert (size detected per-binary above -- e.g. 856 bytes on some
+            # 1.12603.x builds, ~1457 bytes on others). Cert size is deterministic, driven
+            # almost entirely by the key algorithm/length -- an RSA-2048 code-signing cert
+            # is ~936 bytes EVERY time, so the old "regenerate the same RSA-2048 key 10x"
+            # loop could never shrink below an 856-byte hole (only serial/dates varied).
+            # Instead, walk a list of progressively smaller key configs and take the first
+            # that fits. RSA-1024 (~675 bytes) is preferred for maximum Authenticode
+            # compatibility; ECDSA P-256 (~540 bytes) is a smaller fallback; RSA-2048
+            # (~936 bytes) only fits a large hole but is kept last. (ECDSA_P256 is the
+            # documented New-SelfSignedCertificate algorithm name -- portable across
+            # Windows versions.) A weak key is acceptable here: trust derives from the
+            # Root-store entry, not key strength.
+            $CertConfigs = @(
+                @{ Label = "RSA 1024";    KeyParams = @{ KeyAlgorithm = "RSA"; KeyLength = 1024 } },
+                @{ Label = "ECDSA P-256"; KeyParams = @{ KeyAlgorithm = "ECDSA_P256" } },
+                @{ Label = "RSA 2048";    KeyParams = @{ KeyAlgorithm = "RSA"; KeyLength = 2048 } }
+            )
 
             $ValidCertFound = $false
-            $Attempts = 1
-            $MaxAttempts = 10
             $Store = New-Object System.Security.Cryptography.X509Certificates.X509Store("Root", "LocalMachine")
             $Store.Open("ReadWrite")
-            
+
             $Cert = $null
             $NewCertBytes = $null
 
-            while (-not $ValidCertFound -and $Attempts -le $MaxAttempts) {
-                Write-Log "Generating self-signed certificate (Attempt $Attempts)..."
-                $Cert = New-SelfSignedCertificate -Subject $CertSubject -Type CodeSigningCert -CertStoreLocation "Cert:\LocalMachine\My" -FriendlyName "Claude_RTL_SelfSigned" -KeyAlgorithm RSA -KeyLength 2048
-                
+            foreach ($Config in $CertConfigs) {
+                Write-Log "Generating self-signed certificate ($($Config.Label))..."
+                $KeyParams = $Config.KeyParams
+                $Cert = New-SelfSignedCertificate -Subject $CertSubject -Type CodeSigningCert -CertStoreLocation "Cert:\LocalMachine\My" -FriendlyName "Claude_RTL_SelfSigned" @KeyParams
+
                 $NewCertBytes = $Cert.RawData
-                
+
                 if ($NewCertBytes.Length -le $OldCertSize) {
                     $Store.Add($Cert)
                     $ValidCertFound = $true
-                    Write-Success "Generated certificate fits! (Size: $($NewCertBytes.Length) bytes, Hole: $OldCertSize bytes)"
+                    Write-Success "Generated certificate fits! ($($Config.Label), Size: $($NewCertBytes.Length) bytes, Hole: $OldCertSize bytes)"
+                    break
                 } else {
-                    Write-Warn "Certificate too large ($($NewCertBytes.Length) bytes). Removing and retrying..."
+                    Write-Warn "Certificate too large ($($Config.Label): $($NewCertBytes.Length) bytes > $OldCertSize). Removing and trying a smaller key..."
                     Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $Cert.Thumbprint } | Remove-Item -ErrorAction SilentlyContinue
-                    $Attempts++
                 }
             }
             $Store.Close()
 
             if (-not $ValidCertFound) {
-                throw "Failed to generate a suitably sized certificate after $MaxAttempts attempts."
+                throw "Failed to generate a certificate small enough to fit the $OldCertSize-byte hole in cowork-svc.exe; even the smallest key config exceeded it."
             }
 
             # Byte-search hash swap mirrors the original r.js script byte-for-byte.
