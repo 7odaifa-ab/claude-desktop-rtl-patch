@@ -157,6 +157,11 @@ function cellDir(text) {
 // Each input is an array of 'rtl' | 'ltr' | null. Header wins; first column is
 // the tie-breaker. Returns 'rtl' (flip columns) or null (leave LTR).
 function tableDirFromCells(headerDirs, firstColDirs) {
+    // First header is the semantic key column (row labels). If it's RTL and the
+    // first data cell agrees, the table is a Hebrew table regardless of how many
+    // product/entity names appear as LTR in subsequent headers.
+    if (headerDirs && headerDirs[0] === 'rtl' &&
+            firstColDirs && firstColDirs[0] === 'rtl') return 'rtl';
     var h = majorityDir(headerDirs || []);
     if (h === 'rtl') return 'rtl';
     if (h === 'ltr') return null;
