@@ -123,14 +123,16 @@
             });
         }
 
-        // --- RAW LaTeX ISOLATION ---
+        // --- RAW LaTeX + BARE-ARITHMETIC ISOLATION ---
         //
         // Claude Desktop (Windows) does not render LaTeX -- it shows raw "$...$" text.
-        // Inside an RTL paragraph the neutral $ \ { } chars scramble the formula. We
-        // isolate each math segment in its own ltr/unicode-bidi:isolate span. We
-        // replace a single TEXT node with a fragment (replaceChild) -- never innerHTML
-        // -- to stay gentle on React reconciliation, and flag islands so we never
-        // re-wrap during streaming.
+        // Inside an RTL paragraph the neutral $ \ { } chars scramble the formula, and
+        // bare arithmetic ("2 + 3 = 5", "5-3", "x = 10") gets mirrored to "5 = 3 + 2"
+        // by the bidi algorithm. We isolate each math segment (LaTeX or bare numeric,
+        // per segmentText) in its own ltr/unicode-bidi:isolate span. We replace a
+        // single TEXT node with a fragment (replaceChild) -- never innerHTML -- to stay
+        // gentle on React reconciliation, and flag islands so we never re-wrap during
+        // streaming.
         var ISLAND_FLAG = 'data-rtl-island';
 
         function isolateMath(root) {
@@ -140,7 +142,13 @@
             var walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, {
                 acceptNode: function(node) {
                     var v = node.nodeValue;
-                    if (!v || (v.indexOf('$') === -1 && v.indexOf('\\') === -1)) return NodeFilter.FILTER_REJECT;
+                    if (!v) return NodeFilter.FILTER_REJECT;
+                    // Cheap pre-filter: a LaTeX hint ($ or \), OR a numeric hint
+                    // (a digit AND an operator). MATH_DIGIT_RE / MATH_OP_RE come from
+                    // the inlined core above and are stateless (no /g flag).
+                    var hasTex = v.indexOf('$') !== -1 || v.indexOf('\\') !== -1;
+                    var hasNum = MATH_DIGIT_RE.test(v) && MATH_OP_RE.test(v);
+                    if (!hasTex && !hasNum) return NodeFilter.FILTER_REJECT;
                     var p = node.parentElement;
                     if (!p) return NodeFilter.FILTER_REJECT;
                     if (p.tagName === 'SCRIPT' || p.tagName === 'STYLE') return NodeFilter.FILTER_REJECT;

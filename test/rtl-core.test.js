@@ -109,3 +109,78 @@ test('stripLeadingLTR drops leading filename then detects RTL', () => {
     const stripped = core.stripLeadingLTR('foo.js שלום עולם');
     assert.strictEqual(core.firstStrong(stripped), 'rtl');
 });
+
+// --- bare numeric / arithmetic isolation (findMathRanges) ---
+
+// Helper: return the isolated substrings for a given input.
+const mathSubs = (s) => core.findMathRanges(s).map(([a, b]) => s.slice(a, b));
+
+test('findMathRanges isolates bare arithmetic inside Hebrew', () => {
+    assert.deepStrictEqual(mathSubs('התוצאה היא 2 + 3 = 5 בסך הכל'), ['2 + 3 = 5']);
+    assert.deepStrictEqual(mathSubs('הטווח הוא 5-3 מעלות'), ['5-3']);
+    assert.deepStrictEqual(mathSubs('נשאר 1/2 מהעוגה'), ['1/2']);
+    assert.deepStrictEqual(mathSubs('הצלחה של 95% מהמשתמשים'), ['95%']);
+    assert.deepStrictEqual(mathSubs('אם x = 10 אז y = 20'), ['x = 10', 'y = 20']);
+    assert.deepStrictEqual(mathSubs('no spaces 2+3=5 here'), ['2+3=5']);
+});
+
+test('findMathRanges keeps a trailing sentence period out of the island', () => {
+    assert.deepStrictEqual(mathSubs('בסך הכל 2 + 3 = 5.'), ['2 + 3 = 5']);
+    assert.deepStrictEqual(mathSubs('כך: 10 / 2 = 5, נכון'), ['10 / 2 = 5']);
+});
+
+test('findMathRanges keeps internal decimals/thousands intact', () => {
+    assert.deepStrictEqual(mathSubs('הסכום 1.5 + 2.5 = 4.0 שקלים'), ['1.5 + 2.5 = 4.0']);
+    assert.deepStrictEqual(mathSubs('יחס 3.14 * 2 בערך'), ['3.14 * 2']);
+});
+
+test('findMathRanges leaves lone numbers / dates / IPs / versions alone', () => {
+    assert.deepStrictEqual(mathSubs('יש לי 5 כלבים'), []);          // lone number
+    assert.deepStrictEqual(mathSubs('ראה עמוד 3 בספר'), []);        // lone number
+    assert.deepStrictEqual(mathSubs('הגרסה היא 1.14271.0.0 כעת'), []); // dotted version, no operator
+    assert.deepStrictEqual(mathSubs('כתובת 192.168.1.1 ברשת'), []); // IP, dots only
+    assert.deepStrictEqual(mathSubs('בשעה 12:30 נתראה'), []);       // time, colon only
+    assert.deepStrictEqual(mathSubs('1. פריט ראשון'), []);          // ordered-list marker
+});
+
+test('findMathRanges leaves currency and Hebrew-glued numbers alone', () => {
+    assert.deepStrictEqual(mathSubs('המחיר $5 + $10 בלבד'), []);    // '$' breaks the run
+    assert.deepStrictEqual(mathSubs('עולה $5.99 היום'), []);        // currency, no operator
+    assert.deepStrictEqual(mathSubs('נפגשנו ב-15 בחודש'), []);      // Hebrew-glued, no whitespace boundary
+});
+
+test('findMathRanges does not swallow surrounding English words', () => {
+    assert.deepStrictEqual(mathSubs('for 2 + 3 apples total'), ['2 + 3']);
+    assert.deepStrictEqual(mathSubs('version 2 of 3 ready'), []);   // no operator between the numbers
+});
+
+test('findMathRanges supports common Unicode operators', () => {
+    assert.deepStrictEqual(mathSubs('שטח 4 × 5 = 20'), ['4 × 5 = 20']); // x multiply, =
+    assert.deepStrictEqual(mathSubs('טמפ\' −5 ≤ 0 מעלות'), ['−5 ≤ 0']); // minus-sign, <=
+});
+
+test('findMathRanges does not cross a newline', () => {
+    assert.deepStrictEqual(mathSubs('שורה 2 + 3\nשורה 4 + 5'), ['2 + 3', '4 + 5']);
+});
+
+test('segmentText isolates bare arithmetic as a math segment', () => {
+    const segs = core.segmentText('עברית 2 + 3 = 5 עוד');
+    assert.strictEqual(segs.length, 3);
+    assert.strictEqual(segs[0].type, 'text');
+    assert.strictEqual(segs[1].type, 'math');
+    assert.strictEqual(segs[1].value, '2 + 3 = 5');
+    assert.strictEqual(segs[2].type, 'text');
+});
+
+test('segmentText: LaTeX wins over an overlapping numeric run', () => {
+    const segs = core.segmentText('נוסחה $x^2 + 1$ סוף');
+    const math = segs.filter((s) => s.type === 'math');
+    assert.strictEqual(math.length, 1);
+    assert.strictEqual(math[0].value, '$x^2 + 1$'); // not split by the inner "+ 1"
+});
+
+test('segmentText still returns single segment for currency-only text (regression)', () => {
+    const segs = core.segmentText('סתם טקסט עם $5 מחיר');
+    assert.strictEqual(segs.length, 1);
+    assert.strictEqual(segs[0].type, 'text');
+});

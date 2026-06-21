@@ -121,15 +121,117 @@ function findLatexRanges(text) {
     return ranges;
 }
 
-// Split text into alternating {type:'text'|'math', value} segments.
+// --- BARE NUMERIC / ARITHMETIC ISOLATION ---
+//
+// Claude frequently writes arithmetic WITHOUT LaTeX delimiters, e.g. a Hebrew
+// sentence containing "2 + 3 = 5". Inside an RTL paragraph the Unicode bidi
+// algorithm lays the number+operator tokens out right-to-left, so it renders
+// mirrored as "5 = 3 + 2". findMathRanges marks such runs so the DOM can isolate
+// LTR -- the same fix findLatexRanges applies to "$...$", extended to bare math.
+//
+// Operator characters whose PRESENCE proves a run is a genuine expression (not a
+// lone number, date, IP, version, or list marker). ASCII core plus common
+// Unicode math (multiply, divide, minus-sign, <=, >=, !=, ~=, arrow, dots,
+// root). Built with String.fromCharCode so the SOURCE stays pure ASCII -- the
+// patch.ps1 this is inlined into is a BOM-less .ps1, and PowerShell 5.1 corrupts
+// non-ASCII source bytes. The '-' is escaped so the string is a safe regex class
+// body. Order/codes: U+00D7 U+00F7 U+00B1 U+2212 U+2264 U+2265 U+2260 U+2248
+// U+2192 U+00B7 U+2022 U+2219 U+2217 U+22C5 U+221A.
+var MATH_OP_CHARS = '+\\-*/=<>%' + String.fromCharCode(
+    0xD7, 0xF7, 0xB1, 0x2212, 0x2264, 0x2265, 0x2260,
+    0x2248, 0x2192, 0xB7, 0x2022, 0x2219, 0x2217, 0x22C5, 0x221A);
+var MATH_OP_RE  = new RegExp('[' + MATH_OP_CHARS + ']');
+var MATH_DIGIT_RE = /[0-9]/;
+// A whitespace-delimited token is "mathy" when built only from digits and math
+// punctuation/operators, OR it is a single Latin letter used as a variable
+// (x, y, n). Multi-letter Latin tokens (English words, "3D", "4K") are NOT
+// mathy, so they break a run and keep prose out of the isolated island.
+var MATH_TOKEN_RE = new RegExp('^(?:[0-9.,:;()\\[\\]{}|' + MATH_OP_CHARS + ']+|[A-Za-z])$');
+
+function isMathyToken(tok) {
+    return !!tok && MATH_TOKEN_RE.test(tok);
+}
+
+// A token may BOUND a run only if it carries an operand -- a digit or a single
+// Latin variable letter. Pure operator/punctuation tokens ("+", "=", "(") can
+// sit inside a run but never start or end it (avoids dangling "+ 3").
+function isOperandToken(tok) {
+    return MATH_DIGIT_RE.test(tok) || /^[A-Za-z]$/.test(tok);
+}
+
+// Find bare numeric/arithmetic runs as [start, end) index pairs over `text`.
+// A run must be whitespace/line delimited, operand-bounded, and contain at least
+// one digit AND one operator. Lone numbers, "$5" currency, Hebrew-glued
+// constructs (a prefix letter joined to a number with no space), dates/IPs
+// without operators, and "1." list markers are deliberately left alone.
+function findMathRanges(text) {
+    var ranges = [];
+    if (!text || !MATH_OP_RE.test(text) || !MATH_DIGIT_RE.test(text)) return ranges;
+
+    // Scan line by line so a run never spans a newline (each line is its own
+    // bidi paragraph). `base` is the absolute offset of the current line.
+    var base = 0;
+    var lines = text.split('\n');
+    for (var li = 0; li < lines.length; li++) {
+        scanLine(lines[li], base);
+        base += lines[li].length + 1; // +1 for the '\n' removed by split
+    }
+    return ranges;
+
+    function scanLine(line, off) {
+        var toks = [];
+        var re = /\S+/g; // non-whitespace tokens; \s breaks them
+        var m;
+        while ((m = re.exec(line)) !== null) {
+            toks.push({ v: m[0], start: m.index, end: m.index + m[0].length });
+        }
+        var i = 0;
+        while (i < toks.length) {
+            if (!isMathyToken(toks[i].v)) { i++; continue; }
+            var j = i;
+            while (j + 1 < toks.length && isMathyToken(toks[j + 1].v)) j++;
+            // toks[i..j] is a maximal mathy group. Trim non-operand tokens off
+            // both ends so the isolated run is operand-bounded.
+            var a = i, b = j;
+            while (a <= b && !isOperandToken(toks[a].v)) a++;
+            while (b >= a && !isOperandToken(toks[b].v)) b--;
+            if (a <= b) {
+                var s = off + toks[a].start;
+                var e = off + toks[b].end;
+                // Drop sentence punctuation that clung to the ends (never part of
+                // a real number at a boundary: a decimal never ends in '.').
+                while (e > s && '.,:;'.indexOf(text.charAt(e - 1)) !== -1) e--;
+                while (e > s && ',:;'.indexOf(text.charAt(s)) !== -1) s++;
+                var sub = text.slice(s, e);
+                if (e - s >= 2 && MATH_DIGIT_RE.test(sub) && MATH_OP_RE.test(sub)) {
+                    ranges.push([s, e]);
+                }
+            }
+            i = j + 1;
+        }
+    }
+}
+
+// Split text into alternating {type:'text'|'math', value} segments. 'math' covers
+// both LaTeX islands (findLatexRanges) and bare arithmetic (findMathRanges); the
+// DOM layer isolates both LTR. LaTeX wins when the two overlap.
 function segmentText(text) {
     var segs = [];
     if (!text) return segs;
     var ranges = findLatexRanges(text);
+    var numeric = findMathRanges(text);
+    for (var n = 0; n < numeric.length; n++) {
+        var ns = numeric[n][0], ne = numeric[n][1], clash = false;
+        for (var c = 0; c < ranges.length; c++) {
+            if (ns < ranges[c][1] && ne > ranges[c][0]) { clash = true; break; }
+        }
+        if (!clash) ranges.push(numeric[n]);
+    }
     if (!ranges.length) {
         segs.push({ type: 'text', value: text });
         return segs;
     }
+    ranges.sort(function (a, b) { return a[0] - b[0]; });
     var pos = 0;
     for (var i = 0; i < ranges.length; i++) {
         if (ranges[i][0] > pos) {
@@ -190,6 +292,7 @@ if (typeof module !== 'undefined' && module.exports) {
         LATEX_SIGNAL: LATEX_SIGNAL,
         hasLatexSignal: hasLatexSignal,
         findLatexRanges: findLatexRanges,
+        findMathRanges: findMathRanges,
         segmentText: segmentText,
         cellDir: cellDir,
         tableDirFromCells: tableDirFromCells,
