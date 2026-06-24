@@ -2289,8 +2289,36 @@ function Install-Patch {
             throw "asar pack failed with exit code $LASTEXITCODE."
         }
         if (-not (Test-FileValid -Path $TmpAsarPath -Type 'asar')) {
+            # Test-FileValid swallows the real exception and returns $false, leaving the
+            # reporter with a generic message. Surface WHY the repacked archive is
+            # unreadable so the failure is diagnosable from patch.log (issue #26).
+            # Each probe is independently guarded so the diagnostics themselves can't
+            # mask the original failure. Gather everything BEFORE deleting the temp.
+            Write-Log "Repacked ASAR validation FAILED -- gathering diagnostics:"
+            try {
+                $diagLen = (Get-Item -LiteralPath $TmpAsarPath -ErrorAction Stop).Length
+                Write-Log "  repacked size: $diagLen bytes"
+            } catch { Write-Log "  could not stat repacked file: $($_.Exception.Message)" }
+            try {
+                $fs = [System.IO.File]::OpenRead($TmpAsarPath)
+                try {
+                    $hdr  = New-Object byte[] 16
+                    $read = $fs.Read($hdr, 0, 16)
+                    $hex  = (0..($read - 1) | ForEach-Object { $hdr[$_].ToString('X2') }) -join ' '
+                    Write-Log "  first $read header bytes (hex): $hex"
+                } finally { $fs.Close() }
+            } catch { Write-Log "  could not read header bytes: $($_.Exception.Message)" }
+            try {
+                $null = Compute-AsarHash $TmpAsarPath
+                Write-Log "  Compute-AsarHash unexpectedly succeeded on retry (transient?)."
+            } catch { Write-Log "  Compute-AsarHash error: $($_.Exception.Message)" }
+            try {
+                $asarVer = (cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1" | Out-String).Trim()
+                Write-Log "  asar package ($($script:AsarPackage)) version: $asarVer"
+            } catch { Write-Log "  could not read asar version: $($_.Exception.Message)" }
+
             if (Test-Path -LiteralPath $TmpAsarPath) { Remove-Item -LiteralPath $TmpAsarPath -Force -ErrorAction SilentlyContinue }
-            throw "Repacked ASAR archive failed integrity check. Refusing to overwrite app.asar."
+            throw "Repacked ASAR archive failed integrity check. Refusing to overwrite app.asar. See the 'Repacked ASAR validation' diagnostics above and in patch.log."
         }
 
         $NewHash = Compute-AsarHash $TmpAsarPath
