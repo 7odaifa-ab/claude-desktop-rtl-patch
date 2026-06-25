@@ -26,6 +26,15 @@ try {
 # normalize the BOM, breaking the signature byte-for-byte. WebClient gives us
 # the exact bytes the maintainer signed.
 $client = New-Object System.Net.WebClient
+# Force a fresh fetch from origin. A stale copy cached by WinINET or an
+# intermediary proxy (e.g. an older patch.ps1 from before the last re-sign)
+# would fail verification for no good reason. This only ever yields the current
+# signed file, so it cannot break a working install.
+try {
+    $client.CachePolicy = New-Object System.Net.Cache.RequestCachePolicy([System.Net.Cache.RequestCacheLevel]::NoCacheNoStore)
+    $client.Headers.Add('Cache-Control', 'no-cache')
+    $client.Headers.Add('Pragma', 'no-cache')
+} catch { }
 try {
     $patchBytes = $client.DownloadData("$RepoBase/patch.ps1")
     $sigB64     = $client.DownloadString("$RepoBase/patch.ps1.sig").Trim()
@@ -60,14 +69,48 @@ try {
     return
 }
 
-# The actual signature check.
+# The actual signature check. Verify the EXACT downloaded bytes first -- the
+# normal path: raw.githubusercontent.com serves the LF bytes the maintainer
+# signed, so this returns $true and nothing below runs. $verifiedBytes is what
+# we hand downstream; in the common case it IS $patchBytes byte-for-byte, so a
+# working install is completely unchanged.
+$verifiedBytes = $patchBytes
 $valid = $rsa.VerifyData(
     $patchBytes, $sigBytes,
     [System.Security.Cryptography.HashAlgorithmName]::SHA256,
     [System.Security.Cryptography.RSASignaturePadding]::Pkcs1
 )
 
+# Fallback: some Windows proxies / antivirus / transfer paths convert LF -> CRLF
+# in transit. The signature is always computed over LF bytes (see
+# tools/sign-release.ps1), and tools/verify-signature.ps1 already normalizes the
+# same way before it verifies. Strip CR-before-LF and re-check. This runs ONLY
+# after the raw check failed, so it can never change a working install. It is
+# NOT a trust weakening: the normalized bytes must still match the maintainer's
+# RSA signature, which only the offline private key can produce.
 if (-not $valid) {
+    $norm = New-Object System.Collections.Generic.List[byte]
+    for ($i = 0; $i -lt $patchBytes.Length; $i++) {
+        if ($patchBytes[$i] -eq 0x0D -and ($i + 1) -lt $patchBytes.Length -and $patchBytes[$i+1] -eq 0x0A) { continue }
+        $norm.Add($patchBytes[$i])
+    }
+    $normBytes = $norm.ToArray()
+    if ($rsa.VerifyData($normBytes, $sigBytes,
+            [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+            [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)) {
+        $valid = $true
+        $verifiedBytes = $normBytes
+    }
+}
+
+if (-not $valid) {
+    # Diagnostics so the user (and maintainer) can tell a benign proxy mangle
+    # from a real attack, and compare the hash against the published value. This
+    # block runs only on failure -- it has no effect on a working install.
+    $dlHash = [BitConverter]::ToString(
+        [Security.Cryptography.SHA256]::Create().ComputeHash($patchBytes)).Replace('-','').ToLower()
+    $looksHtml = $patchBytes.Length -ge 1 -and ([char]$patchBytes[0] -eq '<')
+
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Red
     Write-Host "  SIGNATURE VERIFICATION FAILED -- REFUSING TO RUN patch.ps1     " -ForegroundColor Red
@@ -75,9 +118,24 @@ if (-not $valid) {
     Write-Host ""
     Write-Host "The downloaded patch does not match the maintainer's signature." -ForegroundColor Yellow
     Write-Host "Possible causes:" -ForegroundColor Yellow
-    Write-Host "  * The GitHub repository was compromised." -ForegroundColor Yellow
-    Write-Host "  * Your network or proxy is intercepting traffic." -ForegroundColor Yellow
+    Write-Host "  * Your network or proxy is intercepting / modifying traffic." -ForegroundColor Yellow
+    Write-Host "  * Antivirus is rewriting the downloaded script." -ForegroundColor Yellow
     Write-Host "  * A maintainer pushed patch.ps1 without re-signing." -ForegroundColor Yellow
+    Write-Host "  * The GitHub repository was compromised." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Diagnostics (please include these if you open an issue):" -ForegroundColor Cyan
+    Write-Host ("  downloaded size  : {0} bytes" -f $patchBytes.Length) -ForegroundColor Gray
+    Write-Host ("  downloaded SHA256: {0}" -f $dlHash) -ForegroundColor Gray
+    if ($looksHtml) {
+        Write-Host "  NOTE: the download starts with '<' -- it looks like an HTML page" -ForegroundColor Yellow
+        Write-Host "        (a proxy login / captive portal), not the script. You are" -ForegroundColor Yellow
+        Write-Host "        almost certainly behind a proxy that intercepts downloads." -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "Most failures are a proxy/AV altering the file, NOT an attack. Try:" -ForegroundColor Cyan
+    Write-Host "  * a different network (e.g. a phone hotspot)," -ForegroundColor Cyan
+    Write-Host "  * temporarily pausing web/HTTPS inspection in your antivirus," -ForegroundColor Cyan
+    Write-Host "  * or cloning the repo and running tools\verify-signature.ps1." -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Cross-check the public-key fingerprint at:" -ForegroundColor Cyan
     Write-Host "  https://github.com/shraga100/claude-desktop-rtl-patch#verification" -ForegroundColor Cyan
@@ -86,7 +144,9 @@ if (-not $valid) {
 
 # Decode bytes to string and strip BOM (we'll re-add it on write). PS 5.1 needs
 # the file to start with a UTF-8 BOM to parse Hebrew/box-drawing characters.
-$content = [System.Text.Encoding]::UTF8.GetString($patchBytes)
+# Use $verifiedBytes -- identical to $patchBytes on the normal path, or the
+# LF-normalized form when the CRLF fallback above accepted it.
+$content = [System.Text.Encoding]::UTF8.GetString($verifiedBytes)
 if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
 [System.IO.File]::WriteAllText($TmpFile, $content, [System.Text.UTF8Encoding]::new($true))
 
