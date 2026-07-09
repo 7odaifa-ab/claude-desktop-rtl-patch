@@ -881,6 +881,97 @@ $global:RtlStateDir  = Join-Path $env:ProgramData "ClaudeRtlPatch"
 $global:RtlStateFile = Join-Path $global:RtlStateDir "state.json"
 $global:RtlTaskName  = "ClaudeRtlPatchWatcher"
 
+# -----------------------------------------------------------------------------
+# TRUST-ANCHOR DIRECTORY HARDENING
+# The auto-update chain READS a pinned pubkey and later EXECUTES update.ps1 /
+# watcher.ps1 from $RtlStateDir WITH ELEVATION. Default C:\ProgramData ACLs let
+# BUILTIN\Users create files (and leave CREATOR OWNER full control), so a
+# standard user could pre-plant any of these files -- or the whole directory as
+# a junction -- before the first install, keep write access after the elevated
+# installer overwrites only the CONTENT (a content write resets neither owner
+# nor ACL), then have their planted script run as admin: a local privilege
+# escalation. Lock the directory to an explicit, non-inherited ACL owned by
+# Administrators (Administrators/SYSTEM full, Users read+execute), and
+# delete-then-recreate each sensitive file so a planted owner/ACL cannot survive.
+function Protect-RtlStateDir {
+    # Returns $true ONLY if the directory is verified to be a real folder owned by
+    # Administrators, with inheritance disabled and no write access for Users.
+    # Callers MUST fail closed on $false -- writing an elevated-executed script
+    # (update.ps1 / watcher.ps1) or the pubkey pin into an unverified directory is
+    # the exact privilege-escalation this guards against.
+    $dir = $global:RtlStateDir
+    try {
+        # A reparse point here is always an attack -- it redirects the elevated
+        # writes below to an attacker-chosen target. Drop the link only
+        # (Directory.Delete on a junction/symlink never touches its target).
+        if (Test-Path $dir) {
+            $existing = Get-Item -LiteralPath $dir -Force
+            if ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                Write-Warn "State dir '$dir' is a reparse point -- removing planted junction/symlink."
+                [System.IO.Directory]::Delete($dir, $false)
+            }
+        }
+        if (-not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+        }
+
+        # Reclaim OWNERSHIP FIRST, then replace the DACL. A standard user who
+        # pre-created the directory owns it and can lock Administrators out of
+        # the ACL entirely; Set-Acl cannot recover from that (it never enables
+        # SeTakeOwnership), but takeown.exe does. icacls then strips inherited
+        # and planted ACEs (/inheritance:r) and installs an explicit ACL by SID
+        # (correct on localized Windows). These are the same in-box tools the
+        # patch already uses in Take-Ownership; cmd /c isolates their stderr.
+        cmd.exe /c "takeown /F `"$dir`" /A >nul 2>&1"
+        cmd.exe /c "icacls `"$dir`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-545:(OI)(CI)RX`" >nul 2>&1"
+
+        # VERIFY and FAIL CLOSED. Re-read state from disk -- never trust the tool
+        # exit codes -- and reject anything an attacker could still control.
+        $chk = Get-Item -LiteralPath $dir -Force
+        if ($chk.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            Write-Warn "State dir '$dir' is still a reparse point after cleanup -- refusing to trust it."
+            return $false
+        }
+        $acl = Get-Acl -LiteralPath $dir
+        $ownerSid = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        if ($ownerSid -ne 'S-1-5-32-544' -and $ownerSid -ne 'S-1-5-18') {
+            Write-Warn "State dir '$dir' owner is $ownerSid (not Administrators/SYSTEM) -- refusing to trust it."
+            return $false
+        }
+        if (-not $acl.AreAccessRulesProtected) {
+            Write-Warn "State dir '$dir' still inherits ACEs (inheritance not disabled) -- refusing to trust it."
+            return $false
+        }
+        $usersWrite = $acl.Access | Where-Object {
+            $_.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            ($_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-545') -and
+            ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Write)
+        }
+        if ($usersWrite) {
+            Write-Warn "State dir '$dir' still grants Users write access -- refusing to trust it."
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Warn "Protect-RtlStateDir failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# Deletes any existing (possibly pre-planted symlink/hardlink or attacker-owned)
+# file so the caller's fresh write inherits the locked directory ACL instead of a
+# planted file's owner/permissions. Call AFTER Protect-RtlStateDir has locked the
+# directory, so the freed slot cannot be re-planted before the write.
+function Remove-PlantedFile([string]$Path) {
+    try {
+        if (Test-Path -LiteralPath $Path) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        }
+    } catch {
+        Write-Warn "Could not remove existing '$([System.IO.Path]::GetFileName($Path))' before rewrite: $($_.Exception.Message)"
+    }
+}
+
 function Get-ClaudeVersionFromPath {
     param([string]$Path)
     if (-not $Path) { return $null }
@@ -902,8 +993,9 @@ function Get-ClaudeVersionFromPath {
 function Save-PatchState {
     param([Parameter(Mandatory)][string]$InstallPath)
     try {
-        if (-not (Test-Path $global:RtlStateDir)) {
-            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        if (-not (Protect-RtlStateDir)) {
+            Write-Warn "State dir could not be secured; not recording patch state (auto-update will stay disabled)."
+            return
         }
         $ver = Get-ClaudeVersionFromPath -Path $InstallPath
         $state = [ordered]@{
@@ -911,6 +1003,7 @@ function Save-PatchState {
             patchedInstallPath = $InstallPath
             patchedAt          = (Get-Date).ToUniversalTime().ToString("o")
         }
+        Remove-PlantedFile $global:RtlStateFile
         $state | ConvertTo-Json | Set-Content -Path $global:RtlStateFile -Encoding UTF8
         Write-Log "Patch state recorded at $global:RtlStateFile (version: $($state.patchedVersion))"
     } catch {
@@ -957,11 +1050,13 @@ function Save-TrustedPubkey {
             return
         }
 
-        if (-not (Test-Path $global:RtlStateDir)) {
-            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        if (-not (Protect-RtlStateDir)) {
+            Write-Warn "State dir could not be secured; refusing to pin the trusted pubkey."
+            return
         }
         $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        Remove-PlantedFile $pinPath
         [IO.File]::WriteAllText($pinPath, $pubB64, $utf8NoBom)
 
         # Log a fingerprint so operators can cross-check against install.ps1 /
@@ -988,11 +1083,13 @@ function Save-UpdateScript {
     # flow against the pinned pubkey. Manual updates bypass install.ps1 (which
     # is unsigned and would otherwise be a code-execution path on a hijacked
     # repo) -- the only network artifact trusted is patch.ps1 + its signature.
-    # Written from an already-elevated caller, so the file inherits ProgramData
-    # ACLs (admin-only write).
+    # Protect-RtlStateDir locks the directory (Administrators-owned, Users
+    # read+execute only) so this elevated-executed helper cannot be pre-planted
+    # or later rewritten by a standard user.
     try {
-        if (-not (Test-Path $global:RtlStateDir)) {
-            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        if (-not (Protect-RtlStateDir)) {
+            Write-Warn "State dir could not be secured; refusing to write the verified-update helper."
+            return
         }
         $updatePath = Join-Path $global:RtlStateDir 'update.ps1'
 
@@ -1113,6 +1210,7 @@ Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.e
 '@
 
         # PS 5.1 needs UTF-8 with BOM to parse Unicode text correctly.
+        Remove-PlantedFile $updatePath
         [System.IO.File]::WriteAllText($updatePath, $updateBody, [System.Text.UTF8Encoding]::new($true))
         Write-Log "Verified-update helper written to $updatePath"
     } catch {
@@ -1122,6 +1220,25 @@ Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.e
 
 function Find-ClaudeDir {
     $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' } | Select-Object -First 1
+    if (-not $pkg) {
+        # UAC elevation can switch identity: a standard user elevating with a
+        # separate admin account gets that admin's (empty) per-user package
+        # list, so Claude registered to the invoking user is invisible (#34).
+        # -AllUsers requires admin, which auto-elevation guarantees by now.
+        Try {
+            # SilentlyContinue: orphaned packages from deleted profiles emit
+            # per-entry errors that would otherwise abort the whole pipeline
+            # under the script-global ErrorActionPreference = Stop.
+            $pkg = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' -and (Test-Path $_.InstallLocation) } |
+                Sort-Object -Property { [version]$_.Version } -Descending |
+                Select-Object -First 1
+            if ($pkg) { Write-Log "Claude package found via -AllUsers fallback (registered to another user account)." }
+            else      { Write-Log "-AllUsers fallback ran but found no Claude package either." }
+        } Catch {
+            Write-Log "Get-AppxPackage -AllUsers fallback failed: $($_.Exception.Message)"
+        }
+    }
     if ($pkg) { return $pkg.InstallLocation }
 
     $squirrelPath = Join-Path $env:LOCALAPPDATA "AnthropicClaude"
@@ -1133,6 +1250,27 @@ function Find-ClaudeDir {
     }
 
     return $null
+}
+
+# Detects the #34 identity-mismatch scenario: a standard user elevated with a
+# SEPARATE admin account's credentials, so this process runs as an identity
+# that doesn't own the Claude registration. Returns the console user's
+# DOMAIN\name only when BOTH hold: (a) the console user's SID differs from
+# ours (SID compare -- name strings for the SAME account can differ between
+# Win32_ComputerSystem.UserName and WindowsIdentity, e.g. Microsoft accounts),
+# and (b) Claude is NOT registered to our (elevated) identity. Returns $null
+# otherwise (including RDP/service sessions where the console user is absent
+# or unrelated -- an RDP admin with Claude registered fails check (b)).
+function Get-MismatchedConsoleUser {
+    Try {
+        $consoleUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+        if (-not $consoleUser) { return $null }
+        $consoleSid = (New-Object System.Security.Principal.NTAccount($consoleUser)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        if ($consoleSid -eq [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { return $null }
+        $mine = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' } | Select-Object -First 1
+        if ($mine) { return $null }
+        return $consoleUser
+    } Catch { return $null }
 }
 
 function Stop-ClaudeServices {
@@ -1595,7 +1733,11 @@ function Start-ClaudeServices {
             Start-Process "shell:AppsFolder\$appId" -ErrorAction Stop
             Write-Success "Claude Desktop launched."
         } else {
-            Write-Warn "Claude AppxPackage not found for launch."
+            # The elevated identity may differ from the account Claude is
+            # registered to (#34) -- app activation is per-user, so launching
+            # from here isn't possible in that case.
+            Write-Warn "Claude isn't registered to this (elevated) account -- or isn't installed."
+            Write-Log "Please start Claude manually from the Start Menu."
         }
     } Catch {
         Write-Warn "Could not launch Claude Desktop: $($_.Exception.Message)"
@@ -1712,6 +1854,18 @@ function Create-UpdateShortcut {
 
         $WshShell = New-Object -comObject WScript.Shell
         $DesktopPath = [Environment]::GetFolderPath('Desktop')
+        # When elevation switched identity (#34), this resolves to the ADMIN's
+        # desktop -- invisible to the account that actually uses Claude. Fall
+        # back to the Public desktop, which every account sees (writing there
+        # requires admin rights, which this elevated process has).
+        $desktopLabel = "your Desktop"
+        if ($env:PUBLIC -and (Get-MismatchedConsoleUser)) {
+            $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
+            if (Test-Path $publicDesktop) {
+                $DesktopPath = $publicDesktop
+                $desktopLabel = "the shared Public Desktop (visible to all accounts)"
+            }
+        }
         $ShortcutPath = Join-Path $DesktopPath "Update Claude RTL.lnk"
         $LocalUpdatePath = Join-Path $global:RtlStateDir 'update.ps1'
 
@@ -1731,7 +1885,7 @@ function Create-UpdateShortcut {
         }
 
         $Shortcut.Save()
-        Write-Success "Shortcut created successfully on your Desktop: $ShortcutPath"
+        Write-Success "Shortcut created successfully on ${desktopLabel}: $ShortcutPath"
         Write-Success "It launches the local verified-update helper: $LocalUpdatePath"
     } Catch {
         Write-Warn "Failed to create shortcut: $($_.Exception.Message)"
@@ -1749,8 +1903,9 @@ function Create-UpdateShortcut {
 # -----------------------------------------------------------------------------
 function Save-WatcherScript {
     try {
-        if (-not (Test-Path $global:RtlStateDir)) {
-            New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null
+        if (-not (Protect-RtlStateDir)) {
+            Write-Warn "State dir could not be secured; refusing to write the auto-update watcher."
+            return
         }
         $watcherPath = Join-Path $global:RtlStateDir 'watcher.ps1'
 
@@ -1768,6 +1923,25 @@ $stateFile      = Join-Path $stateDir "state.json"
 $logFile        = Join-Path $stateDir "watcher.log"
 $lastActionFile = Join-Path $stateDir "last-action.txt"
 $pubkeyPinFile  = Join-Path $stateDir "trusted-pubkey.b64"
+# Files created in ProgramData by the elevated installer (state.json, the
+# pubkey pin, an admin-created watcher.log) are not writable by standard
+# users, so when this watcher runs as one (#34) appends can be denied. Probe
+# the log for real append access and move ONLY the writable artifacts (log +
+# throttle) to the user's LocalAppData; state.json and the pinned pubkey stay
+# in ProgramData and are only read. Only access-denied triggers the move --
+# transient sharing violations (AV scan) must not relocate an admin watcher's log.
+try {
+    if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
+    $probe = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+    $probe.Close()
+} catch [System.UnauthorizedAccessException] {
+    try {
+        $userStateDir = Join-Path $env:LOCALAPPDATA "ClaudeRtlPatch"
+        if (-not (Test-Path $userStateDir)) { New-Item -ItemType Directory -Path $userStateDir -Force | Out-Null }
+        $logFile        = Join-Path $userStateDir "watcher.log"
+        $lastActionFile = Join-Path $userStateDir "last-action.txt"
+    } catch {}
+} catch {}
 # The watcher fetches patch.ps1 + patch.ps1.sig DIRECTLY and verifies them with
 # the locally-pinned pubkey. install.ps1 is intentionally NOT used here: it is
 # unsigned, and any compromised version of install.ps1 served from a hijacked
@@ -1921,10 +2095,18 @@ function Invoke-AutoPatch($newVer, $exePath) {
     if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
     [System.IO.File]::WriteAllText($tmpFile, $content, [System.Text.UTF8Encoding]::new($true))
 
-    Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
-
-    # Kill running Claude processes for snappy UX (patch.ps1 will kill again via Stop-ClaudeServices).
-    Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    # An unelevated watcher (registered for a standard user, #34) must NOT kill
+    # Claude before elevation: the re-patch will pause on a UAC prompt, and if
+    # the user can't approve it they'd be stuck in a kill-relaunch-prompt loop.
+    # Elevated watchers keep the original snappy kill-first behavior.
+    $watcherIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if ($watcherIsAdmin) {
+        Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
+        # Kill running Claude processes for snappy UX (patch.ps1 will kill again via Stop-ClaudeServices).
+        Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    } else {
+        Show-Toast "Claude updated to v$newVer" "The RTL patch needs re-applying. Please approve the admin (UAC) prompt."
+    }
 
     try {
         # Propagate the pinned pubkey to the child so any re-registration that
@@ -1988,6 +2170,7 @@ while ($true) {
 '@
 
         # PS 5.1 needs UTF-8 with BOM to parse Unicode text (Hebrew + toast XML) correctly.
+        Remove-PlantedFile $watcherPath
         [System.IO.File]::WriteAllText($watcherPath, $watcherBody, [System.Text.UTF8Encoding]::new($true))
         Write-Log "Watcher script written to $watcherPath"
     } catch {
@@ -2016,8 +2199,28 @@ function Install-AutoUpdateTask {
     Save-WatcherScript
     $watcherPath = Join-Path $global:RtlStateDir 'watcher.ps1'
 
+    # Save-WatcherScript / Save-TrustedPubkey fail closed if the state dir can't
+    # be locked to Administrators (trust-anchor hardening). Never register a
+    # scheduled task that runs a watcher script from an unverified directory.
+    if (-not (Test-Path $watcherPath)) {
+        Write-Warn "Watcher script was not written (state dir could not be secured); skipping task registration."
+        Write-Warn "The RTL patch itself is applied; only the automatic re-patch on updates is disabled."
+        return
+    }
+
     Try {
         $userName  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        # After UAC elevation with separate admin credentials, GetCurrent() is
+        # the admin -- an account that never logs on interactively, so an
+        # AtLogOn/Interactive task registered to it would never fire (#34).
+        # Register for the console user instead; re-patching then goes through
+        # the verified update helper's UAC prompt at that user's logon.
+        $identityMismatch = $false
+        $consoleUser = Get-MismatchedConsoleUser
+        if ($consoleUser) {
+            $identityMismatch = $true
+            $userName = $consoleUser
+        }
         $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
             -Argument "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$watcherPath`""
         $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $userName
@@ -2037,7 +2240,13 @@ function Install-AutoUpdateTask {
         Start-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
         Write-Success "Scheduled Task '$global:RtlTaskName' installed and started."
         Write-Success "Watcher logs: $(Join-Path $global:RtlStateDir 'watcher.log')"
-        Write-Success "It will run automatically on every logon (and is now active for this session)."
+        if ($identityMismatch) {
+            Write-Success "Registered for $userName (the account that uses Claude), not the admin account running this patch."
+            Write-Warn "When Claude updates, a UAC prompt for admin approval will appear before the patch is re-applied."
+            Write-Warn "If ProgramData isn't writable for that account, watcher logs land in its LocalAppData\ClaudeRtlPatch instead."
+        } else {
+            Write-Success "It will run automatically on every logon (and is now active for this session)."
+        }
     } Catch {
         Write-Warn "Failed to install scheduled task: $($_.Exception.Message)"
     }
@@ -2542,8 +2751,14 @@ function Install-Patch {
         # existing users without requiring them to recreate the shortcut.
         Save-UpdateScript
         try {
-            $existingShortcut = Join-Path ([Environment]::GetFolderPath('Desktop')) "Update Claude RTL.lnk"
-            if (Test-Path $existingShortcut) {
+            # Check both spots Create-UpdateShortcut may have used: the current
+            # (elevated) desktop and the Public desktop (identity mismatch, #34).
+            $shortcutName = "Update Claude RTL.lnk"
+            $shortcutSpots = @( (Join-Path ([Environment]::GetFolderPath('Desktop')) $shortcutName) )
+            if ($env:PUBLIC) {
+                $shortcutSpots += Join-Path (Join-Path $env:PUBLIC 'Desktop') $shortcutName
+            }
+            if ($shortcutSpots | Where-Object { Test-Path $_ }) {
                 Create-UpdateShortcut
             }
         } catch {
