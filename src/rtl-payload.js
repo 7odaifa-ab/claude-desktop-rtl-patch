@@ -4,6 +4,16 @@
     try {
         var WRITING_SEL = '[data-testid="chat-input"]';
 
+        // Never mutate DOM that a live editor owns (issue #33). ProseMirror
+        // reverts foreign mutations inside its subtree, which re-fires our
+        // MutationObserver, which mutates again -- an infinite loop that hangs
+        // the app. WRITING_SEL alone is brittle: the testid is served by
+        // claude.ai and can change at any moment, so skip-guards detect the
+        // editor by its fundamental nature instead. Deliberately NOT a bare
+        // [contenteditable]: that would also match contenteditable="false"
+        // widgets and strip RTL from rendered content.
+        var EDITOR_SEL = WRITING_SEL + ', [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .ProseMirror, [role="textbox"]';
+
         // --- PURE DETECTION CORE (inlined from src/rtl-core.js by build-payload.ps1) ---
         /*__RTL_CORE__*/
         // --- END PURE DETECTION CORE ---
@@ -111,14 +121,19 @@
         }
 
         function forceCodeLTR(root) {
+            // Inside editors the injected stylesheet already pins pre/code/katex
+            // LTR; stamping here would fight ProseMirror (issue #33).
             qsa(root, 'pre, .code-block__code, .relative.group\\/copy').forEach(function(b) {
+                if (b.closest(EDITOR_SEL)) return;
                 b.dir = 'ltr'; b.style.textAlign = 'left'; b.style.unicodeBidi = 'embed';
             });
             qsa(root, 'code').forEach(function(c) {
+                if (c.closest(EDITOR_SEL)) return;
                 if (!c.closest('pre') && !c.closest('.code-block__code')) c.dir = 'ltr';
             });
             // Rendered math (KaTeX/MathJax), if present, is an LTR island too.
             qsa(root, '.katex, .katex-display, mjx-container').forEach(function(m) {
+                if (m.closest(EDITOR_SEL)) return;
                 m.style.unicodeBidi = 'isolate'; m.style.direction = 'ltr';
             });
         }
@@ -152,7 +167,11 @@
                     var p = node.parentElement;
                     if (!p) return NodeFilter.FILTER_REJECT;
                     if (p.tagName === 'SCRIPT' || p.tagName === 'STYLE') return NodeFilter.FILTER_REJECT;
-                    if (p.closest('pre, code, .code-block__code, [' + ISLAND_FLAG + '], ' + WRITING_SEL)) return NodeFilter.FILTER_REJECT;
+                    // EDITOR_SEL, not WRITING_SEL: replaceChild on a text node
+                    // the user is typing into is the most violent mutation an
+                    // editor can receive -- "-" then a digit passes the numeric
+                    // pre-filter above and ignited the issue #33 freeze loop.
+                    if (p.closest('pre, code, .code-block__code, [' + ISLAND_FLAG + '], ' + EDITOR_SEL)) return NodeFilter.FILTER_REJECT;
                     return NodeFilter.FILTER_ACCEPT;
                 }
             });
@@ -193,7 +212,7 @@
         function processTables(root) {
             qsa(root, 'table').forEach(function(t) {
                 if (t.getAttribute(TABLE_FLAG) === 'rtl') return;
-                if (t.closest(WRITING_SEL)) return;
+                if (t.closest(EDITOR_SEL)) return;
                 var headerCells = Array.from(t.querySelectorAll('thead th'));
                 if (!headerCells.length) {
                     var firstRow = t.querySelector('tr');
@@ -217,7 +236,7 @@
         function processText(root) {
             // Standard text elements
             qsa(root, 'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
+                if (el.closest(EDITOR_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 var dir = detectElDir(el);
                 if (dir) {
@@ -245,7 +264,7 @@
 
             // Lists
             qsa(root, 'ul, ol').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('pre')) return;
+                if (el.closest(EDITOR_SEL) || el.closest('pre')) return;
                 var dir = detectElDir(el);
                 if (dir === 'rtl') {
                     el.dir = 'rtl';
@@ -262,7 +281,7 @@
         // Universal: process ANY leaf text container (catches dialogs, tooltips, etc.)
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
-                if (el.closest('pre') || el.closest('code') || el.closest(WRITING_SEL)) return;
+                if (el.closest('pre') || el.closest('code') || el.closest(EDITOR_SEL)) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 if (el.hasAttribute(ISLAND_FLAG)) return;
                 var parent = el.parentElement;
@@ -347,13 +366,29 @@
 
             // Watch DOM changes (throttle, not debounce -- process DURING streaming)
             var pendingMuts = [];
+
+            // Structural loop-breaker (issue #33), independent of the per-element
+            // skip-guards: a freeze loop needs "editor mutation -> schedule ->
+            // write into editor -> editor mutation". Dropping editor-internal
+            // records at intake cuts that chain at its first link, so even a
+            // future missed guard degrades to a one-shot fight instead of a
+            // hang. Also skips rescheduling work on every keystroke burst.
+            function mutInsideEditor(m) {
+                var t = m.target;
+                var el = (t && t.nodeType === 1) ? t : (t ? t.parentElement : null);
+                return !!(el && el.closest && el.closest(EDITOR_SEL));
+            }
+
             var obs = new MutationObserver(function(muts) {
-                var dominated = false;
+                var relevant = [];
                 for (var i = 0; i < muts.length; i++) {
-                    if (muts[i].addedNodes.length > 0 || muts[i].type === 'characterData') { dominated = true; break; }
+                    var m = muts[i];
+                    if (m.addedNodes.length === 0 && m.type !== 'characterData') continue;
+                    if (mutInsideEditor(m)) continue;
+                    relevant.push(m);
                 }
-                if (!dominated) return;
-                for (var j = 0; j < muts.length; j++) pendingMuts.push(muts[j]);
+                if (!relevant.length) return;
+                for (var j = 0; j < relevant.length; j++) pendingMuts.push(relevant[j]);
                 if (window._rtlT) return; // throttle: already scheduled
                 window._rtlT = setTimeout(function() {
                     window._rtlT = null;
