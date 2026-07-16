@@ -7,7 +7,10 @@
 'use strict';
 
 // Strong-RTL code-point ranges, [lo, hi] inclusive. Covers the modern living
-// RTL scripts plus the common historic/astral ones. Tested against code points
+// RTL scripts plus the common historic/astral ones, and the explicit RTL bidi
+// control characters (RLM/RLE/RLO/RLI) -- a text whose author forced RTL via a
+// control mark IS strong-RTL (parity with claude.ai's native detector, which
+// treats U+200F/U+202B/U+202E as RTL). Tested against code points
 // (codePointAt), NOT UTF-16 code units, so astral blocks like Adlam work.
 var RTL_RANGES = [
     [0x0590, 0x05FF], // Hebrew
@@ -21,6 +24,10 @@ var RTL_RANGES = [
     [0x0860, 0x086F], // Syriac Supplement
     [0x0870, 0x089F], // Arabic Extended-B
     [0x08A0, 0x08FF], // Arabic Extended-A
+    [0x200F, 0x200F], // Right-to-Left Mark (RLM)
+    [0x202B, 0x202B], // Right-to-Left Embedding (RLE)
+    [0x202E, 0x202E], // Right-to-Left Override (RLO)
+    [0x2067, 0x2067], // Right-to-Left Isolate (RLI)
     [0xFB1D, 0xFB4F], // Hebrew presentation forms
     [0xFB50, 0xFDFF], // Arabic presentation forms-A
     [0xFE70, 0xFEFF], // Arabic presentation forms-B

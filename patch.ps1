@@ -91,6 +91,52 @@ $RTL_INJECTION_CODE = @'
         // widgets and strip RTL from rendered content.
         var EDITOR_SEL = WRITING_SEL + ', [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .ProseMirror, [role="textbox"]';
 
+        // --- NATIVE RTL INTEROP (claude.ai "alluvium" renderer, 2026) ---
+        //
+        // claude.ai now stamps dir="rtl|ltr" on markdown blocks natively (Code
+        // tab today; a chat renderer with the same logic sits disabled in the
+        // bundle). Their detector is first-strong over the first 80 chars,
+        // INCLUDING inline code/URLs; lists are judged by their first item
+        // only, tables by their first header cell only. Cells, list items,
+        // user messages, inputs and UI chrome get no native dir at all.
+        //
+        // Ownership rule: every dir the patch sets carries MANAGED_FLAG. A dir
+        // WITHOUT the flag is native -- it is NEVER removed or reset (React
+        // re-stamps it on each streaming re-render; fighting it garbles the
+        // page). The patch overrides a native dir only via the code-aware
+        // confident layers, and freely fills every gap native leaves.
+        var MANAGED_FLAG = 'data-rtl-managed';
+        var NATIVE_DIR_SEL = '[dir]:not([' + MANAGED_FLAG + '])';
+        // Streaming markdown host: frontier blocks re-render continuously
+        // while streaming, so structural work (math islands) waits for quiet.
+        var STREAM_HOST_SEL = '[data-alluvium]';
+
+        function isNativeDir(el) {
+            return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
+        }
+
+        // True when el sits under a native-dir'd ancestor (or is one itself).
+        // <html>/<body> are excluded: on a Hebrew-locale OS claude.ai stamps
+        // dir="rtl" on the ROOT element -- a page-wide default, not a per-block
+        // decision -- and treating it as native ownership would turn every
+        // guard into a global no-op.
+        function inNativeDirSubtree(el) {
+            var host = el.closest ? el.closest(NATIVE_DIR_SEL) : null;
+            return !!(host && host !== document.documentElement && host !== document.body);
+        }
+
+        function stampDir(el, dir) {
+            el.setAttribute(MANAGED_FLAG, '1');
+            el.dir = dir;
+            el.style.direction = dir;
+        }
+
+        function unstampDir(el) {
+            if (el.hasAttribute('dir')) el.removeAttribute('dir');
+            el.removeAttribute(MANAGED_FLAG);
+            el.style.direction = '';
+        }
+
         // --- PURE DETECTION CORE (inlined from src/rtl-core.js by build-payload.ps1) ---
         // rtl-core.js -- pure, DOM-free RTL/LaTeX detection logic.
 //
@@ -101,7 +147,10 @@ $RTL_INJECTION_CODE = @'
 'use strict';
 
 // Strong-RTL code-point ranges, [lo, hi] inclusive. Covers the modern living
-// RTL scripts plus the common historic/astral ones. Tested against code points
+// RTL scripts plus the common historic/astral ones, and the explicit RTL bidi
+// control characters (RLM/RLE/RLO/RLI) -- a text whose author forced RTL via a
+// control mark IS strong-RTL (parity with claude.ai's native detector, which
+// treats U+200F/U+202B/U+202E as RTL). Tested against code points
 // (codePointAt), NOT UTF-16 code units, so astral blocks like Adlam work.
 var RTL_RANGES = [
     [0x0590, 0x05FF], // Hebrew
@@ -115,6 +164,10 @@ var RTL_RANGES = [
     [0x0860, 0x086F], // Syriac Supplement
     [0x0870, 0x089F], // Arabic Extended-B
     [0x08A0, 0x08FF], // Arabic Extended-A
+    [0x200F, 0x200F], // Right-to-Left Mark (RLM)
+    [0x202B, 0x202B], // Right-to-Left Embedding (RLE)
+    [0x202E, 0x202E], // Right-to-Left Override (RLO)
+    [0x2067, 0x2067], // Right-to-Left Isolate (RLI)
     [0xFB1D, 0xFB4F], // Hebrew presentation forms
     [0xFB50, 0xFDFF], // Arabic presentation forms-A
     [0xFE70, 0xFEFF], // Arabic presentation forms-B
@@ -416,7 +469,11 @@ function majorityDir(dirs) {
             // unicode-bidi:plaintext: <br> is a paragraph separator in the Unicode
             // BiDi algorithm, so each line auto-picks its direction from first-strong.
             el.setAttribute(RTL_SPLIT_FLAG, '1');
-            if (el.hasAttribute('dir')) el.removeAttribute('dir');
+            // Only a patch-owned dir may be removed. A NATIVE dir stays put
+            // (ownership rule); unicode-bidi:plaintext neutralizes it anyway,
+            // because plaintext resolves each line from its own first-strong
+            // character regardless of the element's dir attribute.
+            if (!isNativeDir(el)) unstampDir(el);
             el.style.direction = '';
             el.style.textAlign = 'start';
             el.style.unicodeBidi = 'plaintext';
@@ -424,14 +481,15 @@ function majorityDir(dirs) {
 
         // If the element inherits RTL via a parent CSS class (not an explicit dir
         // attribute on itself), removing dir alone won't free it -- pin direction=ltr.
+        // NEVER touches a native dir: deleting one re-ignites the React re-stamp
+        // fight that garbled the Code tab (the original merge conflict).
         function resetDirOrPinLTR(el) {
+            if (isNativeDir(el)) return;
             if (window.getComputedStyle(el).direction === 'rtl') {
-                el.dir = 'ltr';
-                el.style.direction = 'ltr';
+                stampDir(el, 'ltr');
                 return;
             }
-            if (el.hasAttribute('dir')) el.removeAttribute('dir');
-            el.style.direction = '';
+            unstampDir(el);
         }
 
         // --- HYBRID DIRECTION DETECTION ---
@@ -453,6 +511,34 @@ function majorityDir(dirs) {
 
             // Layer 3: RTL chars exist but hide behind code/filenames -> treat as RTL.
             return 'rtl';
+        }
+
+        // Layers 1-2 ONLY -- the confidence bar for contradicting a NATIVE dir.
+        // Native scans the first 80 chars INCLUDING inline code/URLs, so a
+        // Hebrew paragraph that opens with `feed_section` gets a native ltr;
+        // layers 1-2 see through that. Layer 3 ("some RTL char exists
+        // somewhere") is the right default for unowned content but is too weak
+        // to overrule a renderer that saw the block's real structure.
+        function detectElDirConfident(el) {
+            var noCode = textWithoutCode(el);
+            if (firstStrong(noCode) === 'rtl') return 'rtl';
+            if (firstStrong(stripLeadingLTR(noCode)) === 'rtl') return 'rtl';
+            return null;
+        }
+
+        // Majority first-strong over a list's items: confident enough to
+        // overrule a native list dir, which is judged by the FIRST item only.
+        function listConfidentDir(el) {
+            var dirs = [];
+            for (var i = 0; i < el.children.length; i++) {
+                var li = el.children[i];
+                if (li.tagName !== 'LI') continue;
+                var t = textWithoutCode(li);
+                var d = firstStrong(t);
+                if (d !== 'rtl') d = firstStrong(stripLeadingLTR(t)) || d;
+                dirs.push(d || null);
+            }
+            return majorityDir(dirs);
         }
 
         // For plain text (input box, dialogs without DOM structure)
@@ -484,11 +570,11 @@ function majorityDir(dirs) {
             // LTR; stamping here would fight ProseMirror (issue #33).
             qsa(root, 'pre, .code-block__code, .relative.group\\/copy').forEach(function(b) {
                 if (b.closest(EDITOR_SEL)) return;
-                b.dir = 'ltr'; b.style.textAlign = 'left'; b.style.unicodeBidi = 'embed';
+                stampDir(b, 'ltr'); b.style.textAlign = 'left'; b.style.unicodeBidi = 'embed';
             });
             qsa(root, 'code').forEach(function(c) {
                 if (c.closest(EDITOR_SEL)) return;
-                if (!c.closest('pre') && !c.closest('.code-block__code')) c.dir = 'ltr';
+                if (!c.closest('pre') && !c.closest('.code-block__code')) stampDir(c, 'ltr');
             });
             // Rendered math (KaTeX/MathJax), if present, is an LTR island too.
             qsa(root, '.katex, .katex-display, mjx-container').forEach(function(m) {
@@ -508,6 +594,19 @@ function majorityDir(dirs) {
         // gentle on React reconciliation, and flag islands so we never re-wrap during
         // streaming.
         var ISLAND_FLAG = 'data-rtl-island';
+
+        // While a streaming markdown host is actively mutating, its frontier
+        // blocks are re-rendered wholesale -- any replaceChild we do there is
+        // clobbered and redone every tick (visible churn). Islands inside a
+        // stream host wait for a quiet window; the observer schedules a settle
+        // pass that catches up once streaming pauses/ends.
+        var lastStreamMut = 0;
+        var STREAM_QUIET_MS = 500;
+
+        function inActiveStream(el) {
+            if (!el.closest || !el.closest(STREAM_HOST_SEL)) return false;
+            return (Date.now() - lastStreamMut) < STREAM_QUIET_MS;
+        }
 
         function isolateMath(root) {
             if (typeof document.createTreeWalker !== 'function') return;
@@ -531,6 +630,8 @@ function majorityDir(dirs) {
                     // editor can receive -- "-" then a digit passes the numeric
                     // pre-filter above and ignited the issue #33 freeze loop.
                     if (p.closest('pre, code, .code-block__code, [' + ISLAND_FLAG + '], ' + EDITOR_SEL)) return NodeFilter.FILTER_REJECT;
+                    // Streaming frontier: defer to the settle pass.
+                    if (inActiveStream(p)) return NodeFilter.FILTER_REJECT;
                     return NodeFilter.FILTER_ACCEPT;
                 }
             });
@@ -572,6 +673,14 @@ function majorityDir(dirs) {
             qsa(root, 'table').forEach(function(t) {
                 if (t.getAttribute(TABLE_FLAG) === 'rtl') return;
                 if (t.closest(EDITOR_SEL)) return;
+                // Native flip: claude.ai stamps dir on the table's WRAPPER div
+                // (judged by the first header cell only). If the columns are
+                // already flowing RTL under a native dir, adopt it -- the flip
+                // happened, only per-cell work (processText) remains.
+                if (inNativeDirSubtree(t) && getComputedStyle(t).direction === 'rtl') {
+                    t.setAttribute(TABLE_FLAG, 'rtl');
+                    return;
+                }
                 var headerCells = Array.from(t.querySelectorAll('thead th'));
                 if (!headerCells.length) {
                     var firstRow = t.querySelector('tr');
@@ -585,9 +694,11 @@ function majorityDir(dirs) {
                     return cell ? cellDir(cell.textContent || '') : null;
                 });
                 if (tableDirFromCells(headerDirs, firstColDirs) === 'rtl') {
+                    // Native missed this one (e.g. Latin-first header cell on a
+                    // Hebrew table). Flip the <table> itself -- stamped, never
+                    // the native wrapper.
                     t.setAttribute(TABLE_FLAG, 'rtl');
-                    t.dir = 'rtl';
-                    t.style.direction = 'rtl';
+                    stampDir(t, 'rtl');
                 }
             });
         }
@@ -597,20 +708,32 @@ function majorityDir(dirs) {
             qsa(root, 'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd').forEach(function(el) {
                 if (el.closest(EDITOR_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
+                if (isNativeDir(el)) {
+                    // Native already directed this block. Add only what native
+                    // cannot express; never remove or downgrade its dir.
+                    if (el.getAttribute('dir') === 'rtl') {
+                        if (hasMultiScriptLines(el)) splitToDirectionalSpans(el);
+                        if (el.tagName === 'LI') el.style.listStylePosition = 'inside';
+                    } else if (hasRTL(el.textContent || '') &&
+                               detectElDirConfident(el) === 'rtl') {
+                        // Confident disagreement (code-prefixed Hebrew): override.
+                        if (hasMultiScriptLines(el)) splitToDirectionalSpans(el);
+                        else stampDir(el, 'rtl');
+                    }
+                    return;
+                }
                 var dir = detectElDir(el);
                 if (dir) {
                     if (dir === 'rtl' && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                         return;
                     }
-                    el.dir = dir;
-                    el.style.direction = dir;
+                    stampDir(el, dir);
                     if (el.tagName === 'LI') {
                         el.style.listStylePosition = (dir === 'rtl') ? 'inside' : '';
                         var parentList = el.closest('ul, ol');
                         if (parentList && dir === 'rtl' && !parentList.hasAttribute('dir')) {
-                            parentList.dir = 'rtl';
-                            parentList.style.direction = 'rtl';
+                            stampDir(parentList, 'rtl');
                             var pl = getComputedStyle(parentList).paddingLeft;
                             if (parseFloat(pl) > 0) { parentList.style.paddingRight = pl; parentList.style.paddingLeft = '0'; }
                         }
@@ -624,10 +747,20 @@ function majorityDir(dirs) {
             // Lists
             qsa(root, 'ul, ol').forEach(function(el) {
                 if (el.closest(EDITOR_SEL) || el.closest('pre')) return;
+                if (isNativeDir(el)) {
+                    // Native judges a list by its FIRST item only. Overrule
+                    // its ltr only on a confident majority of item dirs.
+                    if (el.getAttribute('dir') !== 'rtl' &&
+                            listConfidentDir(el) === 'rtl') {
+                        stampDir(el, 'rtl');
+                        var npl = getComputedStyle(el).paddingLeft;
+                        if (parseFloat(npl) > 0) { el.style.paddingRight = npl; el.style.paddingLeft = '0'; }
+                    }
+                    return;
+                }
                 var dir = detectElDir(el);
                 if (dir === 'rtl') {
-                    el.dir = 'rtl';
-                    el.style.direction = 'rtl';
+                    stampDir(el, 'rtl');
                     var pl = getComputedStyle(el).paddingLeft;
                     if (parseFloat(pl) > 0) { el.style.paddingRight = pl; el.style.paddingLeft = '0'; }
                 } else {
@@ -641,6 +774,11 @@ function majorityDir(dirs) {
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
                 if (el.closest('pre') || el.closest('code') || el.closest(EDITOR_SEL)) return;
+                // A subtree under NATIVE direction control is native's problem
+                // space: its inline spans are React-owned and the block-level
+                // dir already resolves them. Poking spans there re-fights the
+                // renderer for zero visual gain.
+                if (inNativeDirSubtree(el)) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 if (el.hasAttribute(ISLAND_FLAG)) return;
                 var parent = el.parentElement;
@@ -653,11 +791,11 @@ function majorityDir(dirs) {
                     if (hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                     } else {
-                        el.dir = detectTextDir(text) || 'rtl';
+                        stampDir(el, detectTextDir(text) || 'rtl');
                         el.style.textAlign = 'start';
                     }
                 } else if (el.hasAttribute('dir')) {
-                    el.removeAttribute('dir');
+                    unstampDir(el);
                     el.style.textAlign = '';
                 }
             });
@@ -697,8 +835,11 @@ function majorityDir(dirs) {
                 '.katex,.katex-display,mjx-container{unicode-bidi:isolate!important;direction:ltr!important}',
                 // Hebrew tables: flip column order; cells keep their own direction.
                 'table[dir="rtl"]{direction:rtl!important}',
-                '[dir]{text-align:start!important}[dir="rtl"]{direction:rtl!important}[dir="ltr"]{direction:ltr!important}',
-                '[dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}',
+                // Scoped to patch-owned dirs: native-dir'd blocks (claude.ai
+                // "alluvium") have their own layout children (word-fade spans)
+                // that a blanket plaintext rule disturbs.
+                '[data-rtl-managed][dir]{text-align:start!important}[data-rtl-managed][dir="rtl"]{direction:rtl!important}[data-rtl-managed][dir="ltr"]{direction:ltr!important}',
+                '[data-rtl-managed][dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}',
                 // RTL: flip sidebar truncation gradient to fade the LEFT edge (issue #7).
                 '[dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 85%,transparent 99%)!important}',
                 '.group:hover [dir="rtl"][class*="mask-image:linear-gradient(to_right"],.group:focus-within [dir="rtl"][class*="mask-image:linear-gradient(to_right"],[data-menu-open="true"] [dir="rtl"][class*="mask-image:linear-gradient(to_right"]{-webkit-mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important;mask-image:linear-gradient(to left,hsl(var(--always-black)) 60%,transparent 78%)!important}'
@@ -738,14 +879,37 @@ function majorityDir(dirs) {
                 return !!(el && el.closest && el.closest(EDITOR_SEL));
             }
 
+            function mutInsideStream(m) {
+                var t = m.target;
+                var el = (t && t.nodeType === 1) ? t : (t ? t.parentElement : null);
+                return !!(el && el.closest && el.closest(STREAM_HOST_SEL));
+            }
+
+            // One-shot settle pass: after a stream host goes quiet, run the
+            // deferred math isolation over it (islands skipped mid-stream).
+            var settleTimer = null;
+            function scheduleStreamSettle() {
+                lastStreamMut = Date.now();
+                if (settleTimer) clearTimeout(settleTimer);
+                settleTimer = setTimeout(function() {
+                    settleTimer = null;
+                    document.querySelectorAll(STREAM_HOST_SEL).forEach(function(h) {
+                        isolateMath(h);
+                    });
+                }, STREAM_QUIET_MS + 100);
+            }
+
             var obs = new MutationObserver(function(muts) {
                 var relevant = [];
+                var touchedStream = false;
                 for (var i = 0; i < muts.length; i++) {
                     var m = muts[i];
                     if (m.addedNodes.length === 0 && m.type !== 'characterData') continue;
                     if (mutInsideEditor(m)) continue;
+                    if (!touchedStream && mutInsideStream(m)) touchedStream = true;
                     relevant.push(m);
                 }
+                if (touchedStream) scheduleStreamSettle();
                 if (!relevant.length) return;
                 for (var j = 0; j < relevant.length; j++) pendingMuts.push(relevant[j]);
                 if (window._rtlT) return; // throttle: already scheduled

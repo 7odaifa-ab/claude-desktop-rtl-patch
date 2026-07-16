@@ -18,6 +18,19 @@ test('isRTL covers expanded ranges', () => {
     assert.ok(!core.isRTL(cp('$')), 'dollar');
 });
 
+test('RTL bidi control marks are strong-RTL (native-detector parity)', () => {
+    assert.ok(core.isRTL(0x200F), 'RLM');
+    assert.ok(core.isRTL(0x202B), 'RLE');
+    assert.ok(core.isRTL(0x202E), 'RLO');
+    assert.ok(core.isRTL(0x2067), 'RLI');
+    assert.ok(!core.isRTL(0x200E), 'LRM stays LTR-neutral');
+    assert.ok(!core.isRTL(0x202A), 'LRE stays LTR-neutral');
+    // An author who forced RTL with a leading RLM gets first-strong rtl even
+    // when the visible text starts Latin.
+    assert.strictEqual(core.firstStrong('‏abc'), 'rtl');
+    assert.ok(core.hasRTL('abc‏'));
+});
+
 test('hasRTL walks code points (astral safe)', () => {
     assert.ok(core.hasRTL('hello שלום'));
     assert.ok(core.hasRTL('text 𞤀𞤣'));       // Adlam only
