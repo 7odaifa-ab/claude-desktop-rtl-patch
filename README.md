@@ -20,8 +20,11 @@ Auto-detects RTL text and aligns direction where it should, without breaking Eng
 
 > [!IMPORTANT]
 > **Update (July 2026): Claude now ships official RTL support — and the patch has been redesigned to build on top of it.**
+>
 > Anthropic added native RTL rendering to the **Code tab**, and the code for the regular **Chat tab** is already present (currently disabled, likely rolling out soon). This is genuinely good news, and hopefully this patch will become unnecessary altogether before long.
+>
 > For now, though, the native logic still has real gaps: no per-cell table direction, no handling of mixed-language lines, mixed lists judged by their first item only, no math/LaTeX isolation, and nothing at all for user messages, the input box, or the rest of the UI. The broken window UI on RTL systems is also still not fixed natively — including the preview window it pushes off to the far left.
+>
 > The patch has therefore been comprehensively reworked to **merge with Claude's native RTL instead of fighting it**: wherever native support exists it is left untouched, and the patch's detection engine fills in everything native still misses. When Anthropic enables native RTL in the Chat tab, the patch will step back there automatically — no update needed.
 
 ---
