@@ -150,19 +150,6 @@
             return rtlMajority(noCode) ? 'rtl' : null;
         }
 
-        // Layers 1-2 ONLY -- the confidence bar for contradicting a NATIVE dir.
-        // Native scans the first 80 chars INCLUDING inline code/URLs, so a
-        // Hebrew paragraph that opens with `feed_section` gets a native ltr;
-        // layers 1-2 see through that. Layer 3 ("some RTL char exists
-        // somewhere") is the right default for unowned content but is too weak
-        // to overrule a renderer that saw the block's real structure.
-        function detectElDirConfident(el) {
-            var noCode = textWithoutCode(el);
-            if (firstStrong(noCode) === 'rtl') return 'rtl';
-            if (firstStrong(stripLeadingLTR(noCode)) === 'rtl') return 'rtl';
-            return null;
-        }
-
         // Majority first-strong over a list's items: confident enough to
         // overrule a native list dir, which is judged by the FIRST item only.
         function listConfidentDir(el) {
@@ -348,14 +335,24 @@
                 if (isNativeDir(el)) {
                     // Native already directed this block. Add only what native
                     // cannot express; never remove or downgrade its dir.
-                    if (el.getAttribute('dir') === 'rtl') {
-                        if (hasMultiScriptLines(el)) splitToDirectionalSpans(el);
-                        if (el.tagName === 'LI') el.style.listStylePosition = 'inside';
-                    } else if (hasRTL(el.textContent || '') &&
-                               detectElDirConfident(el) === 'rtl') {
-                        // Confident disagreement (code-prefixed Hebrew): override.
-                        if (hasMultiScriptLines(el)) splitToDirectionalSpans(el);
-                        else stampDir(el, 'rtl');
+                    //
+                    // Multi-script lines first, for EITHER native dir: native
+                    // gives the whole block one dir from its first 80 chars,
+                    // so a Hebrew quote whose first line is a Latin marker
+                    // ("[!IMPORTANT]<br>...") gets ltr and every Hebrew line
+                    // below renders backwards. plaintext resolves each line
+                    // independently and leaves the native dir attribute alone.
+                    if (hasRTL(el.textContent || '') && hasMultiScriptLines(el)) {
+                        splitToDirectionalSpans(el);
+                    } else if (el.getAttribute('dir') !== 'rtl' &&
+                               detectElDir(el) === 'rtl') {
+                        // Disagreement (code-prefixed or Latin-first Hebrew):
+                        // override. Safe now that layer 3 requires an RTL
+                        // majority rather than a single RTL character.
+                        stampDir(el, 'rtl');
+                    }
+                    if (el.getAttribute('dir') === 'rtl' && el.tagName === 'LI') {
+                        el.style.listStylePosition = 'inside';
                     }
                     return;
                 }
