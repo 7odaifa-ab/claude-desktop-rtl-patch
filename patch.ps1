@@ -2663,6 +2663,9 @@ function Install-Patch {
             $Injected = 0
             $MainInjected = 0
             $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+            # A leading "use strict"; must stay the FIRST statement of every file
+            # the patch prepends to. Both injection branches below insert AFTER it.
+            $strictRe = '^\s*("use strict"|''use strict'')\s*;'
             foreach ($file in $JsFiles) {
                 if ($SkipEntirely -contains $file.Name) {
                     Write-Log "Skipped non-renderer file (no DOM): $($file.Name)"
@@ -2677,7 +2680,6 @@ function Install-Patch {
                     # the first statement) and silently disable strict mode for the whole
                     # main bundle.
                     if ($content -match "CLAUDE RTL MAIN PATCH START") { continue }
-                    $strictRe = '^\s*("use strict"|''use strict'')\s*;'
                     if ($content -match $strictRe) {
                         $prologue = $matches[0]
                         $newContent = $prologue + "`n" + $MAIN_INJECTION_CODE + "`n" + $content.Substring($prologue.Length)
@@ -2699,9 +2701,20 @@ function Install-Patch {
                     continue
                 }
 
-                # Renderer file: inject the RTL/DOM payload.
+                # Renderer file: inject the RTL/DOM payload. Insert AFTER a leading
+                # "use strict"; -- a bare prepend demotes the directive (it must be
+                # the first statement) and silently switches the whole chunk to
+                # sloppy mode. Sloppy mode flips detached-call `this` from undefined
+                # to globalThis, which broke winston's `const u = this || a` logger
+                # fallback in the session-start chunks on 1.22209.0.0 (issue #36:
+                # "u._addDefaultMeta is not a function" on Claude Code/Cowork start).
                 if ($content -match "CLAUDE RTL PATCH START") { continue }
-                $newContent = $RTL_INJECTION_CODE + "`n" + $content
+                if ($content -match $strictRe) {
+                    $prologue = $matches[0]
+                    $newContent = $prologue + "`n" + $RTL_INJECTION_CODE + "`n" + $content.Substring($prologue.Length)
+                } else {
+                    $newContent = $RTL_INJECTION_CODE + "`n" + $content
+                }
                 [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
                 $Injected++
                 Write-Log "Injected RTL into: $($file.Name)"
