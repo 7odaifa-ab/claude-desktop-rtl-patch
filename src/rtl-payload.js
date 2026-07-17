@@ -1,6 +1,12 @@
 ;(function() {
     'use strict';
     if (typeof document === 'undefined') return;
+    // Once-per-window guard. The patch prepends this payload to EVERY renderer
+    // chunk, and a window lazy-loads many chunks -- without the guard each
+    // loaded chunk would register its own MutationObserver and input listener,
+    // multiplying the work done on every DOM mutation. First copy wins.
+    if (window.__claudeRtlInit) return;
+    window.__claudeRtlInit = true;
     try {
         var WRITING_SEL = '[data-testid="chat-input"]';
 
