@@ -71,6 +71,23 @@ function firstStrong(text) {
     return null;
 }
 
+// Majority script over the text: strong-RTL code points vs Latin letters.
+// The last-resort tie-breaker: when first-strong (even after stripping leading
+// LTR noise) says LTR but RTL characters do exist, majority decides. An
+// English sentence that merely quotes a Hebrew word stays LTR, while a Hebrew
+// paragraph opening with an unstripped Latin run still flips RTL.
+function rtlMajority(text) {
+    if (!text) return false;
+    var r = 0, l = 0;
+    for (var i = 0; i < text.length;) {
+        var cp = text.codePointAt(i);
+        if (isRTL(cp)) r++;
+        else if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) l++;
+        i += cp > 0xFFFF ? 2 : 1;
+    }
+    return r > l;
+}
+
 // Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a
 // Hebrew sentence that starts with "foo.js" still detects as RTL.
 function stripLeadingLTR(text) {
@@ -295,6 +312,7 @@ if (typeof module !== 'undefined' && module.exports) {
         isRTL: isRTL,
         hasRTL: hasRTL,
         firstStrong: firstStrong,
+        rtlMajority: rtlMajority,
         stripLeadingLTR: stripLeadingLTR,
         LATEX_SIGNAL: LATEX_SIGNAL,
         hasLatexSignal: hasLatexSignal,

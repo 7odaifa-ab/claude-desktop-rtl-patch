@@ -45,6 +45,19 @@ test('firstStrong picks first strong character', () => {
     assert.strictEqual(core.firstStrong('123 456'), null);
 });
 
+test('rtlMajority: majority script decides ambiguous mixed text', () => {
+    // English sentence quoting one Hebrew word -> Latin majority, stays LTR.
+    assert.ok(!core.rtlMajority('The word שלום means hello'));
+    // Hebrew sentence with an embedded English term -> RTL majority.
+    assert.ok(core.rtlMajority('אני כתבתי string אחד בתוך משפט'));
+    assert.ok(!core.rtlMajority('plain english only'));
+    assert.ok(core.rtlMajority('עברית בלבד'));
+    // Digits/punctuation are neutral -- they never vote.
+    assert.ok(core.rtlMajority('123 456 !!! שלום'));
+    assert.ok(!core.rtlMajority('123 456 !!! abc'));
+    assert.ok(!core.rtlMajority(''));
+});
+
 test('currency $ is NOT treated as LaTeX', () => {
     assert.deepStrictEqual(core.findLatexRanges('המחיר הוא $5.99 היום'), []);
     assert.deepStrictEqual(core.findLatexRanges('עולה $5 עד $10'), []);

@@ -211,6 +211,23 @@ function firstStrong(text) {
     return null;
 }
 
+// Majority script over the text: strong-RTL code points vs Latin letters.
+// The last-resort tie-breaker: when first-strong (even after stripping leading
+// LTR noise) says LTR but RTL characters do exist, majority decides. An
+// English sentence that merely quotes a Hebrew word stays LTR, while a Hebrew
+// paragraph opening with an unstripped Latin run still flips RTL.
+function rtlMajority(text) {
+    if (!text) return false;
+    var r = 0, l = 0;
+    for (var i = 0; i < text.length;) {
+        var cp = text.codePointAt(i);
+        if (isRTL(cp)) r++;
+        else if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) l++;
+        i += cp > 0xFFFF ? 2 : 1;
+    }
+    return r > l;
+}
+
 // Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a
 // Hebrew sentence that starts with "foo.js" still detects as RTL.
 function stripLeadingLTR(text) {
@@ -509,8 +526,11 @@ function majorityDir(dirs) {
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 3: RTL chars exist but hide behind code/filenames -> treat as RTL.
-            return 'rtl';
+            // Layer 3: RTL chars exist but first-strong still says LTR even
+            // after stripping -- majority script decides. An English paragraph
+            // quoting a single Hebrew word stays LTR; a Hebrew-dominant block
+            // whose Latin prefix survived the strip still flips RTL.
+            return rtlMajority(noCode) ? 'rtl' : null;
         }
 
         // Layers 1-2 ONLY -- the confidence bar for contradicting a NATIVE dir.
@@ -552,7 +572,7 @@ function majorityDir(dirs) {
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            return 'rtl';
+            return rtlMajority(text) ? 'rtl' : 'ltr';
         }
 
         // --- ELEMENT PROCESSING ---

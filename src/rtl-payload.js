@@ -143,8 +143,11 @@
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 3: RTL chars exist but hide behind code/filenames -> treat as RTL.
-            return 'rtl';
+            // Layer 3: RTL chars exist but first-strong still says LTR even
+            // after stripping -- majority script decides. An English paragraph
+            // quoting a single Hebrew word stays LTR; a Hebrew-dominant block
+            // whose Latin prefix survived the strip still flips RTL.
+            return rtlMajority(noCode) ? 'rtl' : null;
         }
 
         // Layers 1-2 ONLY -- the confidence bar for contradicting a NATIVE dir.
@@ -186,7 +189,7 @@
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            return 'rtl';
+            return rtlMajority(text) ? 'rtl' : 'ltr';
         }
 
         // --- ELEMENT PROCESSING ---
