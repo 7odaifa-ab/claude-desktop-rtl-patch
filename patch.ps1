@@ -1973,6 +1973,89 @@ function Take-Ownership($Path) {
     cmd.exe /c "icacls `"$Path`" /grant `"*S-1-5-32-544:(OI)(CI)F`" /T /Q >nul 2>&1"
 }
 
+function Remove-CertPrivateKey {
+    <#
+    .SYNOPSIS
+        Destroys the private key material behind a certificate and VERIFIES it is gone.
+        Handles RSA *and* ECDSA keys, over CNG or (legacy) CSP providers.
+    .DESCRIPTION
+        The self-signed cert the patch generates may use RSA (1024/2048) OR ECDSA P-256
+        (the smaller-hole fallback config). The previous inline wipe only ever called
+        GetRSAPrivateKey -- which returns $null for an ECDSA cert -- so an ECDSA private
+        key was NEVER deleted: it stayed in the machine key store while its public cert
+        remained trusted machine-wide in Root, i.e. a usable code-signing key an admin
+        attacker could reuse. This deletes the key for every config and then re-checks the
+        key container no longer exists, so the caller can fail loudly if it survived.
+    .OUTPUTS
+        [bool] $true only when no private key remains (deleted and verified, or there was
+        none to begin with). $false when a key may still exist or removal can't be confirmed.
+    #>
+    param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
+
+    if (-not $Cert.HasPrivateKey) { return $true }
+
+    # Capture the CNG container name BEFORE deletion -- needed for the fallback delete and
+    # for the post-delete existence check. Legacy CSP keys don't expose it this way ($null).
+    $container = $null
+    try {
+        $probe = $null
+        try { $probe = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert) } catch {}
+        if (-not $probe) { try { $probe = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($Cert) } catch {} }
+        if ($probe -is [System.Security.Cryptography.RSACng])   { $container = $probe.Key.UniqueName }
+        elseif ($probe -is [System.Security.Cryptography.ECDsaCng]) { $container = $probe.Key.UniqueName }
+    } catch {}
+
+    # Typed deletion: RSA (CNG or legacy CSP) or ECDSA (always CNG).
+    $deleted = $false
+    try {
+        $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($Cert)
+        if ($rsa -is [System.Security.Cryptography.RSACng]) {
+            $rsa.Key.Delete(); $deleted = $true
+        } elseif ($rsa -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+            $rsa.PersistKeyInCsp = $false; $rsa.Clear(); $deleted = $true
+        } else {
+            $ec = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($Cert)
+            if ($ec -is [System.Security.Cryptography.ECDsaCng]) {
+                $ec.Key.Delete(); $deleted = $true
+            }
+        }
+    } catch {
+        Write-Log "Remove-CertPrivateKey: typed delete threw ($($_.Exception.Message)); trying CngKey fallback."
+    }
+
+    # Fallback: open the container by name and delete it directly. Covers the case where the
+    # typed path didn't match a known provider type but we still hold the container name.
+    if (-not $deleted -and $container) {
+        try {
+            $prov = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+            $opts = [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
+            if ([System.Security.Cryptography.CngKey]::Exists($container, $prov, $opts)) {
+                $ck = [System.Security.Cryptography.CngKey]::Open($container, $prov, $opts)
+                $ck.Delete(); $deleted = $true
+            }
+        } catch {
+            Write-Log "Remove-CertPrivateKey: CngKey fallback threw: $($_.Exception.Message)"
+        }
+    }
+
+    # Verify: if we know the container, it MUST no longer exist. This is what lets the
+    # caller fail loudly instead of trusting a delete call that silently no-op'd.
+    if ($container) {
+        try {
+            $prov = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+            $opts = [System.Security.Cryptography.CngKeyOpenOptions]::MachineKey
+            if ([System.Security.Cryptography.CngKey]::Exists($container, $prov, $opts)) {
+                Write-Log "Remove-CertPrivateKey: key container '$container' still exists after delete attempt."
+                return $false
+            }
+            return $true
+        } catch {
+            # Exists() throwing isn't proof the key survived; fall back to the $deleted signal.
+        }
+    }
+    return $deleted
+}
+
 function Compute-AsarHash($AsarPath) {
     $fs = [System.IO.File]::OpenRead($AsarPath)
     $br = New-Object System.IO.BinaryReader($fs)
@@ -2940,34 +3023,51 @@ function Install-Patch {
             # we delete the CSP/CNG key material via .NET, then remove the cert
             # via X509Store — this works on PS 5.1 and PS 7+ uniformly.
             $myStore = $null
+            $keyDestroyed = $false
             Try {
                 $thumb  = $Cert.Thumbprint
                 $myStore = New-Object System.Security.Cryptography.X509Certificates.X509Store("My", "LocalMachine")
                 $myStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
                 $found = $myStore.Certificates | Where-Object { $_.Thumbprint -eq $thumb }
                 if ($found) {
-                    if ($found.HasPrivateKey) {
-                        Try {
-                            $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($found)
-                            if ($rsa -is [System.Security.Cryptography.RSACng]) {
-                                $rsa.Key.Delete()
-                            } elseif ($rsa -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
-                                $rsa.PersistKeyInCsp = $false
-                                $rsa.Clear()
-                            }
-                        } Catch {
-                            Write-Warn "Could not delete CSP/CNG key material: $($_.Exception.Message)"
-                        }
-                    }
+                    # Destroy the private key for RTL's cert regardless of algorithm. The old
+                    # code only handled RSA; an ECDSA fallback cert leaked its key because
+                    # GetRSAPrivateKey returns $null for it. Remove-CertPrivateKey verifies.
+                    $keyDestroyed = Remove-CertPrivateKey -Cert $found
                     $myStore.Remove($found)
-                    Write-Success "Private signing key wiped from My store (Root cert retained)"
+                    if ($keyDestroyed) {
+                        Write-Success "Private signing key wiped and verified gone (Root cert retained)"
+                    }
                 } else {
-                    Write-Warn "Cert with thumbprint $thumb not found in My store; nothing to wipe."
+                    Write-Warn "Cert with thumbprint $thumb not found in My store; cannot verify key removal."
                 }
             } Catch {
                 Write-Warn "Could not delete private key: $($_.Exception.Message)"
             } Finally {
                 if ($myStore) { $myStore.Close() }
+            }
+
+            if (-not $keyDestroyed) {
+                # BACKSTOP (rare): the private key could not be verifiably destroyed, so a
+                # usable code-signing key may persist alongside the machine-trusted Root
+                # cert. Do NOT report success -- surface it loudly with recovery steps. The
+                # RTL patch itself is applied and keeps working (per chosen policy).
+                Write-Warn "Signing private key could NOT be verified as deleted -- see the red banner below."
+                Write-Host ""
+                Write-Host "================================================================" -ForegroundColor Red
+                Write-Host "  [!] SIGNING KEY NOT VERIFIABLY WIPED -- ACTION RECOMMENDED     " -ForegroundColor Red
+                Write-Host "================================================================" -ForegroundColor Red
+                Write-Host ""
+                Write-Host "The self-signed certificate is trusted machine-wide (Root store)," -ForegroundColor Yellow
+                Write-Host "and its PRIVATE KEY may still exist on this machine. An attacker" -ForegroundColor Yellow
+                Write-Host "with admin rights could reuse it to sign code Windows would trust." -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "To neutralize it:" -ForegroundColor Cyan
+                Write-Host "  * Reboot and re-run this patch (option 1) -- the wipe usually" -ForegroundColor Cyan
+                Write-Host "    succeeds once no process is holding the key store, OR" -ForegroundColor Cyan
+                Write-Host "  * Run tools\claude-removal-diag.ps1 to locate and remove the" -ForegroundColor Cyan
+                Write-Host "    'Claude_RTL_SelfSigned' certificate and its key container." -ForegroundColor Cyan
+                Write-Host ""
             }
 
         } else {
@@ -3184,7 +3284,13 @@ function Restore-Patch {
 
     Write-Log "Cleaning up custom certificates..."
     Try {
-        Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.FriendlyName -eq 'Claude_RTL_SelfSigned' } | Remove-Item -ErrorAction SilentlyContinue
+        # Delete the private key material FIRST (RSA and ECDSA, including orphaned key
+        # containers left by older ECDSA installs that never wiped the key), THEN remove
+        # the certs. Remove-Item on the Cert: provider deletes the cert but NOT the key.
+        Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.FriendlyName -eq 'Claude_RTL_SelfSigned' } | ForEach-Object {
+            $null = Remove-CertPrivateKey -Cert $_
+            Remove-Item $_.PSPath -ErrorAction SilentlyContinue
+        }
         Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.FriendlyName -eq 'Claude_RTL_SelfSigned' } | Remove-Item -ErrorAction SilentlyContinue
         Write-Success "Custom certificates removed from system store."
     } Catch {
