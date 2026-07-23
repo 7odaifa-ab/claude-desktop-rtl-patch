@@ -1,17 +1,14 @@
 // rtl-core.js -- pure, DOM-free RTL/LaTeX detection logic.
 //
-// SOURCE OF TRUTH for the detection engine. tools/build-payload.ps1 inlines the
-// function bodies of this file into the injected IIFE inside patch.ps1 (it strips
-// the module.exports guard at the bottom). test/rtl-core.test.js requires this
-// file directly. Keep this file DOM-free so it stays unit-testable.
+// SOURCE OF TRUTH for the detection engine. tools/build-payload.ps1 inlines this
+// file into the injected IIFE inside patch.ps1 (stripping the module.exports guard
+// at the bottom); test/rtl-core.test.js requires it directly. Keep it DOM-free.
 'use strict';
 
-// Strong-RTL code-point ranges, [lo, hi] inclusive. Covers the modern living
-// RTL scripts plus the common historic/astral ones, and the explicit RTL bidi
-// control characters (RLM/RLE/RLO/RLI) -- a text whose author forced RTL via a
-// control mark IS strong-RTL (parity with claude.ai's native detector, which
-// treats U+200F/U+202B/U+202E as RTL). Tested against code points
-// (codePointAt), NOT UTF-16 code units, so astral blocks like Adlam work.
+// Strong-RTL code-point ranges, [lo, hi] inclusive. Covers living RTL scripts plus
+// common historic/astral ones and the explicit RTL bidi controls (RLM/RLE/RLO/RLI),
+// matching claude.ai's native detector. Tested against code points (codePointAt),
+// not UTF-16 code units, so astral blocks like Adlam work.
 var RTL_RANGES = [
     [0x0590, 0x05FF], // Hebrew
     [0x0600, 0x06FF], // Arabic
@@ -40,7 +37,6 @@ var RTL_RANGES = [
     [0x1EE00, 0x1EEFF]  // Arabic Mathematical Alphabetic Symbols
 ];
 
-// cp: a Unicode code point (from String.prototype.codePointAt).
 function isRTL(cp) {
     for (var i = 0; i < RTL_RANGES.length; i++) {
         if (cp >= RTL_RANGES[i][0] && cp <= RTL_RANGES[i][1]) return true;
@@ -64,18 +60,16 @@ function firstStrong(text) {
     for (var i = 0; i < text.length;) {
         var cp = text.codePointAt(i);
         if (isRTL(cp)) return 'rtl';
-        // ASCII Latin letters are strong-LTR (matches the original /[a-zA-Z]/ rule).
+        // ASCII Latin letters are strong-LTR.
         if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) return 'ltr';
         i += cp > 0xFFFF ? 2 : 1;
     }
     return null;
 }
 
-// Majority script over the text: strong-RTL code points vs Latin letters.
-// The last-resort tie-breaker: when first-strong (even after stripping leading
-// LTR noise) says LTR but RTL characters do exist, majority decides. An
-// English sentence that merely quotes a Hebrew word stays LTR, while a Hebrew
-// paragraph opening with an unstripped Latin run still flips RTL.
+// Majority script: strong-RTL code points vs Latin letters. Last-resort tie-breaker
+// when first-strong says LTR but RTL characters exist -- an English sentence quoting
+// a Hebrew word stays LTR; a Hebrew paragraph opening with a Latin run flips RTL.
 function rtlMajority(text) {
     if (!text) return false;
     var r = 0, l = 0;
@@ -88,8 +82,8 @@ function rtlMajority(text) {
     return r > l;
 }
 
-// Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a
-// Hebrew sentence that starts with "foo.js" still detects as RTL.
+// Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a Hebrew
+// sentence that starts with "foo.js" still detects as RTL.
 function stripLeadingLTR(text) {
     return text
         .replace(/^[\s]*(?:[\w.\-]+\.[\w]{1,5})\s*/g, '')
@@ -98,17 +92,16 @@ function stripLeadingLTR(text) {
         .replace(/`[^`]+`/g, '');
 }
 
-// A "$...$" body is treated as math only when it carries a real LaTeX signal.
-// This is the currency guard: "$5.99" or "$5 to $10" lack the signal and stay text.
+// A "$...$" body is math only with a real LaTeX signal (currency guard: "$5.99" stays text).
 var LATEX_SIGNAL = /[\\^_{}]|\b(?:frac|sqrt|sum|prod|int|lim|infty|cdot|times|div|leq|geq|neq|approx|partial|nabla|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|omega|matrix|begin|end|left|right|text|mathbb|mathcal|vec|hat|bar|overline|underline)\b/;
 
 function hasLatexSignal(body) {
     return LATEX_SIGNAL.test(body);
 }
 
-// Find math regions as [start, end) index pairs over `text`.
-// Unambiguous delimiters ($$...$$, \[...\], \(...\)) always count; single $...$
-// only counts with a LaTeX signal and only outside already-claimed regions.
+// Find math regions as [start, end) index pairs. Unambiguous delimiters
+// ($$...$$, \[...\], \(...\)) always count; single $...$ only with a LaTeX signal
+// and only outside already-claimed regions.
 function findLatexRanges(text) {
     var ranges = [];
     if (!text) return ranges;
@@ -134,66 +127,56 @@ function findLatexRanges(text) {
         return false;
     }
 
-    // Order matters: claim the unambiguous, greedier delimiters first.
+    // Claim the unambiguous, greedier delimiters first.
     claim(/\$\$[\s\S]+?\$\$/g, false, 0, 0);
     claim(/\\\[[\s\S]+?\\\]/g, false, 0, 0);
     claim(/\\\([\s\S]+?\\\)/g, false, 0, 0);
-    // Single $...$ -- no newline inside, must carry a LaTeX signal (currency guard).
-    claim(/\$[^$\n]+?\$/g, true, 1, 1);
+    claim(/\$[^$\n]+?\$/g, true, 1, 1); // single $...$: no newline, must carry a LaTeX signal
 
     ranges.sort(function (a, b) { return a[0] - b[0]; });
     return ranges;
 }
 
 // --- BARE NUMERIC / ARITHMETIC ISOLATION ---
+// Claude often writes arithmetic without LaTeX delimiters ("2 + 3 = 5"); inside an
+// RTL paragraph the bidi algorithm mirrors it to "5 = 3 + 2". findMathRanges marks
+// such runs so the DOM can isolate them LTR.
 //
-// Claude frequently writes arithmetic WITHOUT LaTeX delimiters, e.g. a Hebrew
-// sentence containing "2 + 3 = 5". Inside an RTL paragraph the Unicode bidi
-// algorithm lays the number+operator tokens out right-to-left, so it renders
-// mirrored as "5 = 3 + 2". findMathRanges marks such runs so the DOM can isolate
-// LTR -- the same fix findLatexRanges applies to "$...$", extended to bare math.
-//
-// Operator characters whose PRESENCE proves a run is a genuine expression (not a
-// lone number, date, IP, version, or list marker). ASCII core plus common
-// Unicode math (multiply, divide, minus-sign, <=, >=, !=, ~=, arrow, dots,
-// root). Built with String.fromCharCode so the SOURCE stays pure ASCII -- the
-// patch.ps1 this is inlined into is a BOM-less .ps1, and PowerShell 5.1 corrupts
-// non-ASCII source bytes. The '-' is escaped so the string is a safe regex class
-// body. Order/codes: U+00D7 U+00F7 U+00B1 U+2212 U+2264 U+2265 U+2260 U+2248
-// U+2192 U+00B7 U+2022 U+2219 U+2217 U+22C5 U+221A.
+// Operator characters proving a run is a genuine expression. Built with
+// String.fromCharCode so the SOURCE stays pure ASCII (patch.ps1 is BOM-less and
+// PowerShell 5.1 corrupts non-ASCII source bytes); '-' is escaped for the regex
+// class. Codes: U+00D7 U+00F7 U+00B1 U+2212 U+2264 U+2265 U+2260 U+2248 U+2192
+// U+00B7 U+2022 U+2219 U+2217 U+22C5 U+221A.
 var MATH_OP_CHARS = '+\\-*/=<>%' + String.fromCharCode(
     0xD7, 0xF7, 0xB1, 0x2212, 0x2264, 0x2265, 0x2260,
     0x2248, 0x2192, 0xB7, 0x2022, 0x2219, 0x2217, 0x22C5, 0x221A);
 var MATH_OP_RE  = new RegExp('[' + MATH_OP_CHARS + ']');
 var MATH_DIGIT_RE = /[0-9]/;
-// A whitespace-delimited token is "mathy" when built only from digits and math
-// punctuation/operators, OR it is a single Latin letter used as a variable
-// (x, y, n). Multi-letter Latin tokens (English words, "3D", "4K") are NOT
-// mathy, so they break a run and keep prose out of the isolated island.
+// A token is "mathy" when built only from digits and math punctuation/operators, OR
+// it is a single Latin variable letter (x, y, n). Multi-letter Latin tokens (words,
+// "3D", "4K") break a run and keep prose out of the island.
 var MATH_TOKEN_RE = new RegExp('^(?:[0-9.,:;()\\[\\]{}|' + MATH_OP_CHARS + ']+|[A-Za-z])$');
 
 function isMathyToken(tok) {
     return !!tok && MATH_TOKEN_RE.test(tok);
 }
 
-// A token may BOUND a run only if it carries an operand -- a digit or a single
-// Latin variable letter. Pure operator/punctuation tokens ("+", "=", "(") can
-// sit inside a run but never start or end it (avoids dangling "+ 3").
+// A token may BOUND a run only if it carries an operand (a digit or single Latin
+// variable letter). Pure operator/punctuation tokens sit inside but never bound it.
 function isOperandToken(tok) {
     return MATH_DIGIT_RE.test(tok) || /^[A-Za-z]$/.test(tok);
 }
 
-// Find bare numeric/arithmetic runs as [start, end) index pairs over `text`.
-// A run must be whitespace/line delimited, operand-bounded, and contain at least
-// one digit AND one operator. Lone numbers, "$5" currency, Hebrew-glued
-// constructs (a prefix letter joined to a number with no space), dates/IPs
-// without operators, and "1." list markers are deliberately left alone.
+// Find bare numeric/arithmetic runs as [start, end) pairs. A run must be
+// whitespace/line delimited, operand-bounded, and contain a digit AND an operator.
+// Lone numbers, "$5", Hebrew-glued constructs, dates/IPs, and "1." list markers are
+// left alone.
 function findMathRanges(text) {
     var ranges = [];
     if (!text || !MATH_OP_RE.test(text) || !MATH_DIGIT_RE.test(text)) return ranges;
 
-    // Scan line by line so a run never spans a newline (each line is its own
-    // bidi paragraph). `base` is the absolute offset of the current line.
+    // Scan line by line so a run never spans a newline (each line is its own bidi
+    // paragraph). `base` is the absolute offset of the current line.
     var base = 0;
     var lines = text.split('\n');
     for (var li = 0; li < lines.length; li++) {
@@ -204,7 +187,7 @@ function findMathRanges(text) {
 
     function scanLine(line, off) {
         var toks = [];
-        var re = /\S+/g; // non-whitespace tokens; \s breaks them
+        var re = /\S+/g;
         var m;
         while ((m = re.exec(line)) !== null) {
             toks.push({ v: m[0], start: m.index, end: m.index + m[0].length });
@@ -214,16 +197,14 @@ function findMathRanges(text) {
             if (!isMathyToken(toks[i].v)) { i++; continue; }
             var j = i;
             while (j + 1 < toks.length && isMathyToken(toks[j + 1].v)) j++;
-            // toks[i..j] is a maximal mathy group. Trim non-operand tokens off
-            // both ends so the isolated run is operand-bounded.
+            // Trim non-operand tokens off both ends so the run is operand-bounded.
             var a = i, b = j;
             while (a <= b && !isOperandToken(toks[a].v)) a++;
             while (b >= a && !isOperandToken(toks[b].v)) b--;
             if (a <= b) {
                 var s = off + toks[a].start;
                 var e = off + toks[b].end;
-                // Drop sentence punctuation that clung to the ends (never part of
-                // a real number at a boundary: a decimal never ends in '.').
+                // Drop sentence punctuation clinging to the ends.
                 while (e > s && '.,:;'.indexOf(text.charAt(e - 1)) !== -1) e--;
                 while (e > s && ',:;'.indexOf(text.charAt(s)) !== -1) s++;
                 var sub = text.slice(s, e);
@@ -237,8 +218,8 @@ function findMathRanges(text) {
 }
 
 // Split text into alternating {type:'text'|'math', value} segments. 'math' covers
-// both LaTeX islands (findLatexRanges) and bare arithmetic (findMathRanges); the
-// DOM layer isolates both LTR. LaTeX wins when the two overlap.
+// LaTeX islands and bare arithmetic; the DOM layer isolates both LTR. LaTeX wins
+// when the two overlap.
 function segmentText(text) {
     var segs = [];
     if (!text) return segs;
@@ -268,24 +249,22 @@ function segmentText(text) {
     return segs;
 }
 
-// Classify a table cell's direction from its text. A cell counts as RTL if it
-// *contains* any RTL character -- not merely if its first strong char is RTL.
-// Header labels often start with a Latin term ("blob ...", "ID ...") yet belong
-// to a Hebrew column, so first-strong is too weak here. Neutral cells (digits,
-// hashes, punctuation only) return null so they do not sway the majority.
+// Classify a table cell's direction. A cell is RTL if it *contains* any RTL char
+// (header labels often start with a Latin term yet belong to a Hebrew column, so
+// first-strong is too weak here). Neutral cells return null so they don't sway
+// the majority.
 function cellDir(text) {
     if (hasRTL(text)) return 'rtl';
     if (firstStrong(text) === 'ltr') return 'ltr';
     return null;
 }
 
-// Decide a whole table's column direction from header / first-column cell dirs.
-// Each input is an array of 'rtl' | 'ltr' | null. Header wins; first column is
-// the tie-breaker. Returns 'rtl' (flip columns) or null (leave LTR).
+// Decide a table's column direction from header / first-column cell dirs (each an
+// array of 'rtl'|'ltr'|null). Header wins; first column is the tie-breaker.
+// Returns 'rtl' (flip columns) or null (leave LTR).
 function tableDirFromCells(headerDirs, firstColDirs) {
-    // First header is the semantic key column (row labels). If it's RTL and the
-    // first data cell agrees, the table is a Hebrew table regardless of how many
-    // product/entity names appear as LTR in subsequent headers.
+    // First header is the semantic key column: if it and the first data cell are
+    // both RTL, it's a Hebrew table regardless of Latin names in later headers.
     if (headerDirs && headerDirs[0] === 'rtl' &&
             firstColDirs && firstColDirs[0] === 'rtl') return 'rtl';
     var h = majorityDir(headerDirs || []);

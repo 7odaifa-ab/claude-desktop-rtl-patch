@@ -1,54 +1,41 @@
 ;(function() {
     'use strict';
     if (typeof document === 'undefined') return;
-    // Once-per-window guard. The patch prepends this payload to EVERY renderer
-    // chunk, and a window lazy-loads many chunks -- without the guard each
-    // loaded chunk would register its own MutationObserver and input listener,
-    // multiplying the work done on every DOM mutation. First copy wins.
+    // Once-per-window guard. The payload is prepended to EVERY renderer chunk and a
+    // window loads many; without this each would register its own observer/listener.
     if (window.__claudeRtlInit) return;
     window.__claudeRtlInit = true;
     try {
         var WRITING_SEL = '[data-testid="chat-input"]';
 
-        // Never mutate DOM that a live editor owns (issue #33). ProseMirror
-        // reverts foreign mutations inside its subtree, which re-fires our
-        // MutationObserver, which mutates again -- an infinite loop that hangs
-        // the app. WRITING_SEL alone is brittle: the testid is served by
-        // claude.ai and can change at any moment, so skip-guards detect the
-        // editor by its fundamental nature instead. Deliberately NOT a bare
-        // [contenteditable]: that would also match contenteditable="false"
-        // widgets and strip RTL from rendered content.
+        // Never mutate DOM a live editor owns (issue #33): ProseMirror reverts foreign
+        // mutations, re-firing our observer into an infinite loop. WRITING_SEL alone is
+        // brittle (the testid can change), so we detect editors by their nature. Not a
+        // bare [contenteditable]: that matches contenteditable="false" widgets too.
         var EDITOR_SEL = WRITING_SEL + ', [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .ProseMirror, [role="textbox"]';
 
-        // --- NATIVE RTL INTEROP (claude.ai "alluvium" renderer, 2026) ---
+        // --- NATIVE RTL INTEROP (claude.ai "alluvium" renderer) ---
+        // claude.ai stamps dir="rtl|ltr" on markdown blocks natively (first-strong over
+        // the first 80 chars incl. inline code/URLs; lists by first item, tables by first
+        // header cell). Cells, list items, user messages, inputs and UI chrome get none.
         //
-        // claude.ai now stamps dir="rtl|ltr" on markdown blocks natively (Code
-        // tab today; a chat renderer with the same logic sits disabled in the
-        // bundle). Their detector is first-strong over the first 80 chars,
-        // INCLUDING inline code/URLs; lists are judged by their first item
-        // only, tables by their first header cell only. Cells, list items,
-        // user messages, inputs and UI chrome get no native dir at all.
-        //
-        // Ownership rule: every dir the patch sets carries MANAGED_FLAG. A dir
-        // WITHOUT the flag is native -- it is NEVER removed or reset (React
-        // re-stamps it on each streaming re-render; fighting it garbles the
-        // page). The patch overrides a native dir only via the code-aware
-        // confident layers, and freely fills every gap native leaves.
+        // Ownership rule: every dir the patch sets carries MANAGED_FLAG. A dir WITHOUT it
+        // is native and is NEVER removed or reset (React re-stamps on each re-render;
+        // fighting it garbles the page). The patch overrides native dir only via the
+        // code-aware confident layers, and freely fills the gaps native leaves.
         var MANAGED_FLAG = 'data-rtl-managed';
         var NATIVE_DIR_SEL = '[dir]:not([' + MANAGED_FLAG + '])';
-        // Streaming markdown host: frontier blocks re-render continuously
-        // while streaming, so structural work (math islands) waits for quiet.
+        // Streaming markdown host: frontier blocks re-render continuously, so structural
+        // work (math islands) waits for quiet.
         var STREAM_HOST_SEL = '[data-alluvium]';
 
         function isNativeDir(el) {
             return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
         }
 
-        // True when el sits under a native-dir'd ancestor (or is one itself).
-        // <html>/<body> are excluded: on a Hebrew-locale OS claude.ai stamps
-        // dir="rtl" on the ROOT element -- a page-wide default, not a per-block
-        // decision -- and treating it as native ownership would turn every
-        // guard into a global no-op.
+        // True when el sits under a native-dir'd ancestor (or is one). <html>/<body> are
+        // excluded: on a Hebrew-locale OS claude.ai stamps dir="rtl" on the ROOT (a
+        // page-wide default), and treating that as native ownership no-ops every guard.
         function inNativeDirSubtree(el) {
             var host = el.closest ? el.closest(NATIVE_DIR_SEL) : null;
             return !!(host && host !== document.documentElement && host !== document.body);
@@ -70,7 +57,7 @@
         /*__RTL_CORE__*/
         // --- END PURE DETECTION CORE ---
 
-        // Get text from element excluding <code> children (DOM-aware)
+        // Text of an element excluding <code>/<pre> children.
         function textWithoutCode(el) {
             var out = '';
             var nodes = el.childNodes;
@@ -85,12 +72,9 @@
         }
 
         // --- PER-LINE DIRECTIONAL SPLITTING ---
-        //
-        // A paragraph rendered with <br> separators or whitespace-pre may carry
-        // multiple lines, each in a different script. Forcing a single dir on the
-        // host element mangles every line that disagrees. We instead defer to
-        // unicode-bidi:plaintext and stamp data-rtl-split so later passes skip it.
-
+        // A paragraph with <br>/newline separators may carry multiple lines in different
+        // scripts; forcing one dir mangles the disagreeing lines. We defer to
+        // unicode-bidi:plaintext and flag data-rtl-split so later passes skip it.
         var RTL_SPLIT_FLAG = 'data-rtl-split';
         var BR_OR_NL_SPLIT = /(<br\s*\/?>|\n)/i;
 
@@ -104,25 +88,19 @@
 
         function splitToDirectionalSpans(el) {
             if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
-            // No DOM rewriting -- assigning el.innerHTML broke React reconciliation
-            // ("Failed to execute 'removeChild' on 'Node'"). Defer to
-            // unicode-bidi:plaintext: <br> is a paragraph separator in the Unicode
-            // BiDi algorithm, so each line auto-picks its direction from first-strong.
+            // No DOM rewriting -- assigning innerHTML broke React reconciliation. Defer to
+            // unicode-bidi:plaintext: each line (a bidi paragraph) auto-picks its direction
+            // from first-strong. Only a patch-owned dir may be removed; a native dir stays
+            // (plaintext neutralizes it anyway).
             el.setAttribute(RTL_SPLIT_FLAG, '1');
-            // Only a patch-owned dir may be removed. A NATIVE dir stays put
-            // (ownership rule); unicode-bidi:plaintext neutralizes it anyway,
-            // because plaintext resolves each line from its own first-strong
-            // character regardless of the element's dir attribute.
             if (!isNativeDir(el)) unstampDir(el);
             el.style.direction = '';
             el.style.textAlign = 'start';
             el.style.unicodeBidi = 'plaintext';
         }
 
-        // If the element inherits RTL via a parent CSS class (not an explicit dir
-        // attribute on itself), removing dir alone won't free it -- pin direction=ltr.
-        // NEVER touches a native dir: deleting one re-ignites the React re-stamp
-        // fight that garbled the Code tab (the original merge conflict).
+        // If RTL is inherited via a parent CSS class (not an explicit dir on the element),
+        // removing dir alone won't free it -- pin direction=ltr. Never touches a native dir.
         function resetDirOrPinLTR(el) {
             if (isNativeDir(el)) return;
             if (window.getComputedStyle(el).direction === 'rtl') {
@@ -134,30 +112,28 @@
 
         // --- HYBRID DIRECTION DETECTION ---
 
-        // For DOM elements (output): 3-layer detection
+        // For DOM elements (output): 3-layer detection.
         function detectElDir(el) {
             var full = el.textContent || '';
             if (!hasRTL(full)) return null;
 
-            // Layer 1: first-strong on text excluding <code> children
+            // Layer 1: first-strong on text excluding <code> children.
             var noCode = textWithoutCode(el);
             var d = firstStrong(noCode);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 2: strip leading filenames/URLs, then first-strong
+            // Layer 2: strip leading filenames/URLs, then first-strong.
             var stripped = stripLeadingLTR(noCode);
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 3: RTL chars exist but first-strong still says LTR even
-            // after stripping -- majority script decides. An English paragraph
-            // quoting a single Hebrew word stays LTR; a Hebrew-dominant block
-            // whose Latin prefix survived the strip still flips RTL.
+            // Layer 3: RTL chars exist but first-strong still says LTR after stripping --
+            // majority script decides.
             return rtlMajority(noCode) ? 'rtl' : null;
         }
 
-        // Majority first-strong over a list's items: confident enough to
-        // overrule a native list dir, which is judged by the FIRST item only.
+        // Majority first-strong over a list's items: confident enough to overrule a native
+        // list dir (which is judged by the FIRST item only).
         function listConfidentDir(el) {
             var dirs = [];
             for (var i = 0; i < el.children.length; i++) {
@@ -171,7 +147,7 @@
             return majorityDir(dirs);
         }
 
-        // For plain text (input box, dialogs without DOM structure)
+        // For plain text (input box, dialogs without DOM structure).
         function detectTextDir(text) {
             if (!text || !text.trim()) return null;
             var d = firstStrong(text);
@@ -187,7 +163,7 @@
 
         // --- ELEMENT PROCESSING ---
 
-        // querySelectorAll that INCLUDES root itself if it matches
+        // querySelectorAll that INCLUDES root itself if it matches.
         function qsa(root, sel) {
             var base = root.querySelectorAll ? root : document;
             var els = Array.from(base.querySelectorAll(sel));
@@ -196,8 +172,8 @@
         }
 
         function forceCodeLTR(root) {
-            // Inside editors the injected stylesheet already pins pre/code/katex
-            // LTR; stamping here would fight ProseMirror (issue #33).
+            // Inside editors the stylesheet already pins pre/code/katex LTR; stamping here
+            // would fight ProseMirror (issue #33).
             qsa(root, 'pre, .code-block__code, .relative.group\\/copy').forEach(function(b) {
                 if (b.closest(EDITOR_SEL)) return;
                 stampDir(b, 'ltr'); b.style.textAlign = 'left'; b.style.unicodeBidi = 'embed';
@@ -206,7 +182,6 @@
                 if (c.closest(EDITOR_SEL)) return;
                 if (!c.closest('pre') && !c.closest('.code-block__code')) stampDir(c, 'ltr');
             });
-            // Rendered math (KaTeX/MathJax), if present, is an LTR island too.
             qsa(root, '.katex, .katex-display, mjx-container').forEach(function(m) {
                 if (m.closest(EDITOR_SEL)) return;
                 m.style.unicodeBidi = 'isolate'; m.style.direction = 'ltr';
@@ -214,22 +189,15 @@
         }
 
         // --- RAW LaTeX + BARE-ARITHMETIC ISOLATION ---
-        //
-        // Claude Desktop (Windows) does not render LaTeX -- it shows raw "$...$" text.
-        // Inside an RTL paragraph the neutral $ \ { } chars scramble the formula, and
-        // bare arithmetic ("2 + 3 = 5", "5-3", "x = 10") gets mirrored to "5 = 3 + 2"
-        // by the bidi algorithm. We isolate each math segment (LaTeX or bare numeric,
-        // per segmentText) in its own ltr/unicode-bidi:isolate span. We replace a
-        // single TEXT node with a fragment (replaceChild) -- never innerHTML -- to stay
-        // gentle on React reconciliation, and flag islands so we never re-wrap during
-        // streaming.
+        // Claude Desktop (Windows) shows raw "$...$" text, and inside an RTL paragraph the
+        // neutral $ \ { } chars scramble formulas while bare arithmetic gets mirrored. We
+        // isolate each math segment (per segmentText) in its own ltr/isolate span via
+        // replaceChild -- never innerHTML -- to stay gentle on React, flagging islands so
+        // we never re-wrap during streaming.
         var ISLAND_FLAG = 'data-rtl-island';
 
-        // While a streaming markdown host is actively mutating, its frontier
-        // blocks are re-rendered wholesale -- any replaceChild we do there is
-        // clobbered and redone every tick (visible churn). Islands inside a
-        // stream host wait for a quiet window; the observer schedules a settle
-        // pass that catches up once streaming pauses/ends.
+        // While a stream host is actively mutating, replaceChild is clobbered each tick.
+        // Islands there wait for a quiet window; the observer schedules a catch-up pass.
         var lastStreamMut = 0;
         var STREAM_QUIET_MS = 500;
 
@@ -246,22 +214,17 @@
                 acceptNode: function(node) {
                     var v = node.nodeValue;
                     if (!v) return NodeFilter.FILTER_REJECT;
-                    // Cheap pre-filter: a LaTeX hint ($ or \), OR a numeric hint
-                    // (a digit AND an operator). MATH_DIGIT_RE / MATH_OP_RE come from
-                    // the inlined core above and are stateless (no /g flag).
+                    // Cheap pre-filter: a LaTeX hint ($ or \) OR a numeric hint (digit AND operator).
                     var hasTex = v.indexOf('$') !== -1 || v.indexOf('\\') !== -1;
                     var hasNum = MATH_DIGIT_RE.test(v) && MATH_OP_RE.test(v);
                     if (!hasTex && !hasNum) return NodeFilter.FILTER_REJECT;
                     var p = node.parentElement;
                     if (!p) return NodeFilter.FILTER_REJECT;
                     if (p.tagName === 'SCRIPT' || p.tagName === 'STYLE') return NodeFilter.FILTER_REJECT;
-                    // EDITOR_SEL, not WRITING_SEL: replaceChild on a text node
-                    // the user is typing into is the most violent mutation an
-                    // editor can receive -- "-" then a digit passes the numeric
-                    // pre-filter above and ignited the issue #33 freeze loop.
+                    // EDITOR_SEL (not WRITING_SEL): replaceChild on a text node the user is
+                    // typing into ignited the issue #33 freeze loop.
                     if (p.closest('pre, code, .code-block__code, [' + ISLAND_FLAG + '], ' + EDITOR_SEL)) return NodeFilter.FILTER_REJECT;
-                    // Streaming frontier: defer to the settle pass.
-                    if (inActiveStream(p)) return NodeFilter.FILTER_REJECT;
+                    if (inActiveStream(p)) return NodeFilter.FILTER_REJECT; // defer to settle pass
                     return NodeFilter.FILTER_ACCEPT;
                 }
             });
@@ -291,22 +254,17 @@
         }
 
         // --- TABLE COLUMN ORDERING ---
-        //
-        // A Hebrew table should read right-to-left: the first column on the right.
-        // Per-cell direction is handled by processText; here we only flip the whole
-        // table's column order via dir="rtl" on a stable <table> element (no text
-        // surgery, low risk). Only flip once we are confident it is a Hebrew table;
-        // leave the flag off otherwise so a table still streaming can re-evaluate.
+        // A Hebrew table should read RTL (first column on the right). Per-cell direction is
+        // handled by processText; here we only flip column order via dir="rtl" on a stable
+        // <table>, and only once confident it's a Hebrew table.
         var TABLE_FLAG = 'data-rtl-table';
 
         function processTables(root) {
             qsa(root, 'table').forEach(function(t) {
                 if (t.getAttribute(TABLE_FLAG) === 'rtl') return;
                 if (t.closest(EDITOR_SEL)) return;
-                // Native flip: claude.ai stamps dir on the table's WRAPPER div
-                // (judged by the first header cell only). If the columns are
-                // already flowing RTL under a native dir, adopt it -- the flip
-                // happened, only per-cell work (processText) remains.
+                // Native flip: claude.ai stamps dir on the table's wrapper div. If columns
+                // already flow RTL under a native dir, adopt it -- only per-cell work remains.
                 if (inNativeDirSubtree(t) && getComputedStyle(t).direction === 'rtl') {
                     t.setAttribute(TABLE_FLAG, 'rtl');
                     return;
@@ -324,9 +282,7 @@
                     return cell ? cellDir(cell.textContent || '') : null;
                 });
                 if (tableDirFromCells(headerDirs, firstColDirs) === 'rtl') {
-                    // Native missed this one (e.g. Latin-first header cell on a
-                    // Hebrew table). Flip the <table> itself -- stamped, never
-                    // the native wrapper.
+                    // Native missed this one -- flip the <table> itself (stamped, never the wrapper).
                     t.setAttribute(TABLE_FLAG, 'rtl');
                     stampDir(t, 'rtl');
                 }
@@ -339,22 +295,15 @@
                 if (el.closest(EDITOR_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 if (isNativeDir(el)) {
-                    // Native already directed this block. Add only what native
-                    // cannot express; never remove or downgrade its dir.
-                    //
-                    // Multi-script lines first, for EITHER native dir: native
-                    // gives the whole block one dir from its first 80 chars,
-                    // so a Hebrew quote whose first line is a Latin marker
-                    // ("[!IMPORTANT]<br>...") gets ltr and every Hebrew line
-                    // below renders backwards. plaintext resolves each line
-                    // independently and leaves the native dir attribute alone.
+                    // Native already directed this block. Add only what native cannot
+                    // express; never remove or downgrade its dir. Multi-script lines first,
+                    // for either native dir: native gives the whole block one dir, so a
+                    // Hebrew quote whose first line is a Latin marker renders backwards.
                     if (hasRTL(el.textContent || '') && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                     } else if (el.getAttribute('dir') !== 'rtl' &&
                                detectElDir(el) === 'rtl') {
-                        // Disagreement (code-prefixed or Latin-first Hebrew):
-                        // override. Safe now that layer 3 requires an RTL
-                        // majority rather than a single RTL character.
+                        // Disagreement (code-prefixed or Latin-first Hebrew): override.
                         stampDir(el, 'rtl');
                     }
                     if (el.getAttribute('dir') === 'rtl' && el.tagName === 'LI') {
@@ -388,8 +337,8 @@
             qsa(root, 'ul, ol').forEach(function(el) {
                 if (el.closest(EDITOR_SEL) || el.closest('pre')) return;
                 if (isNativeDir(el)) {
-                    // Native judges a list by its FIRST item only. Overrule
-                    // its ltr only on a confident majority of item dirs.
+                    // Native judges a list by its FIRST item only. Overrule ltr only on a
+                    // confident majority of item dirs.
                     if (el.getAttribute('dir') !== 'rtl' &&
                             listConfidentDir(el) === 'rtl') {
                         stampDir(el, 'rtl');
@@ -410,14 +359,12 @@
             });
         }
 
-        // Universal: process ANY leaf text container (catches dialogs, tooltips, etc.)
+        // Universal: process ANY leaf text container (dialogs, tooltips, etc.)
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
                 if (el.closest('pre') || el.closest('code') || el.closest(EDITOR_SEL)) return;
-                // A subtree under NATIVE direction control is native's problem
-                // space: its inline spans are React-owned and the block-level
-                // dir already resolves them. Poking spans there re-fights the
-                // renderer for zero visual gain.
+                // A subtree under native dir control is native's problem space: its inline
+                // spans are React-owned and the block dir already resolves them.
                 if (inNativeDirSubtree(el)) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 if (el.hasAttribute(ISLAND_FLAG)) return;
@@ -475,9 +422,8 @@
                 '.katex,.katex-display,mjx-container{unicode-bidi:isolate!important;direction:ltr!important}',
                 // Hebrew tables: flip column order; cells keep their own direction.
                 'table[dir="rtl"]{direction:rtl!important}',
-                // Scoped to patch-owned dirs: native-dir'd blocks (claude.ai
-                // "alluvium") have their own layout children (word-fade spans)
-                // that a blanket plaintext rule disturbs.
+                // Scoped to patch-owned dirs: native-dir'd blocks have their own layout
+                // children (word-fade spans) that a blanket plaintext rule disturbs.
                 '[data-rtl-managed][dir]{text-align:start!important}[data-rtl-managed][dir="rtl"]{direction:rtl!important}[data-rtl-managed][dir="ltr"]{direction:ltr!important}',
                 '[data-rtl-managed][dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}',
                 // RTL: flip sidebar truncation gradient to fade the LEFT edge (issue #7).
@@ -507,12 +453,9 @@
             // Watch DOM changes (throttle, not debounce -- process DURING streaming)
             var pendingMuts = [];
 
-            // Structural loop-breaker (issue #33), independent of the per-element
-            // skip-guards: a freeze loop needs "editor mutation -> schedule ->
-            // write into editor -> editor mutation". Dropping editor-internal
-            // records at intake cuts that chain at its first link, so even a
-            // future missed guard degrades to a one-shot fight instead of a
-            // hang. Also skips rescheduling work on every keystroke burst.
+            // Structural loop-breaker (issue #33): a freeze loop needs "editor mutation ->
+            // schedule -> write into editor -> editor mutation". Dropping editor-internal
+            // records at intake cuts that chain at its first link.
             function mutInsideEditor(m) {
                 var t = m.target;
                 var el = (t && t.nodeType === 1) ? t : (t ? t.parentElement : null);
@@ -525,8 +468,8 @@
                 return !!(el && el.closest && el.closest(STREAM_HOST_SEL));
             }
 
-            // One-shot settle pass: after a stream host goes quiet, run the
-            // deferred math isolation over it (islands skipped mid-stream).
+            // One-shot settle pass: after a stream host goes quiet, run the deferred math
+            // isolation over it (islands skipped mid-stream).
             var settleTimer = null;
             function scheduleStreamSettle() {
                 lastStreamMut = Date.now();

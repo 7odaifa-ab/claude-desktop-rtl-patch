@@ -14,11 +14,8 @@ param(
 # Env-var fallback for `irm | iex` invocations where param binding is not possible.
 if (-not $Auto -and $env:CLAUDE_RTL_AUTO -eq '1') { $Auto = $true }
 
-# The trusted pubkey is passed as a PARAMETER, not an env var: environment
-# variables set by install.ps1 / update.ps1 before Start-Process -Verb RunAs do
-# NOT survive the UAC elevation boundary, so the elevated patch.ps1 would never
-# see them and Save-TrustedPubkey would skip the pin. Mirror the param into the
-# env var the rest of the script already reads.
+# Passed as a PARAMETER, not an env var: env vars don't survive the UAC elevation
+# boundary. Mirror it into the env var the rest of the script reads.
 if ($TrustedPubKey) { $env:CLAUDE_RTL_TRUSTED_PUBKEY = $TrustedPubKey }
 
 # -----------------------------------------------------------------------------
@@ -28,22 +25,17 @@ if ($TrustedPubKey) { $env:CLAUDE_RTL_TRUSTED_PUBKEY = $TrustedPubKey }
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
-    # Prefer the locally-installed verified-update helper if it exists. That
-    # helper (written admin-only at install time, see Save-UpdateScript) uses
-    # the pinned pubkey to verify patch.ps1 before elevation -- hermetic
-    # against a compromised GitHub repo. install.ps1 is unsigned, so falling
-    # back to it is acceptable ONLY for first-time bootstrap where no local
-    # trust anchor exists yet.
+    # Prefer the local verified-update helper (written admin-only at install time):
+    # it verifies patch.ps1 against the pinned pubkey before elevation. Falling back
+    # to the unsigned install.ps1 is acceptable only for first-time bootstrap.
     $LocalUpdate = Join-Path $env:ProgramData "ClaudeRtlPatch\update.ps1"
     if (Test-Path $LocalUpdate) {
         if ($Auto) { $env:CLAUDE_RTL_AUTO = '1' }
         & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $LocalUpdate
         Exit
     }
-    # First-install bootstrap: no local pin yet. TOFU on install.ps1 -- the
-    # same exposure the user already accepts when running `irm install.ps1 | iex`.
-    # PS 5.1 defaults to TLS 1.0; GitHub requires 1.2+ -- enable it before the
-    # IRM call below or the fallback fails with an opaque connection error.
+    # First-install bootstrap: no local pin yet. TOFU on install.ps1 (same exposure
+    # as `irm install.ps1 | iex`). PS 5.1 defaults to TLS 1.0; GitHub needs 1.2+.
     try {
         [Net.ServicePointManager]::SecurityProtocol =
             [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -61,15 +53,12 @@ $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
 $global:TmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "claude_rtl_patch_tmp"
 
-# Pinned npm packages (C4 mitigation). 'asar' (unscoped) was deprecated by Electron;
-# @electron/asar is the maintained drop-in replacement. Bump these by hand after
-# reviewing the upstream changelog — never use 'latest', which is a moving target.
+# Pinned npm packages (C4 mitigation). Bump by hand after reviewing the upstream
+# changelog -- never 'latest'.
 $script:AsarPackage  = '@electron/asar@4.2.0'
 $script:FusesPackage = '@electron/fuses@2.1.1'
-# Minimum Node these pinned packages will run on (both declare engines.node
-# >=22.12.0). Keep in sync when bumping the packages above. Used to turn the old
-# misleading "install Node" error into a precise "upgrade Node" message when an
-# older Node (e.g. the EOL v18) is present but too old to run the toolchain.
+# Minimum Node the pinned packages run on (both declare engines.node >=22.12.0).
+# Keep in sync when bumping; drives the precise "upgrade Node" error message.
 $script:MinNodeVersion = '22.12.0'
 
 # Exact JS logic from r.js
@@ -78,54 +67,41 @@ $RTL_INJECTION_CODE = @'
 ;(function() {
     'use strict';
     if (typeof document === 'undefined') return;
-    // Once-per-window guard. The patch prepends this payload to EVERY renderer
-    // chunk, and a window lazy-loads many chunks -- without the guard each
-    // loaded chunk would register its own MutationObserver and input listener,
-    // multiplying the work done on every DOM mutation. First copy wins.
+    // Once-per-window guard. The payload is prepended to EVERY renderer chunk and a
+    // window loads many; without this each would register its own observer/listener.
     if (window.__claudeRtlInit) return;
     window.__claudeRtlInit = true;
     try {
         var WRITING_SEL = '[data-testid="chat-input"]';
 
-        // Never mutate DOM that a live editor owns (issue #33). ProseMirror
-        // reverts foreign mutations inside its subtree, which re-fires our
-        // MutationObserver, which mutates again -- an infinite loop that hangs
-        // the app. WRITING_SEL alone is brittle: the testid is served by
-        // claude.ai and can change at any moment, so skip-guards detect the
-        // editor by its fundamental nature instead. Deliberately NOT a bare
-        // [contenteditable]: that would also match contenteditable="false"
-        // widgets and strip RTL from rendered content.
+        // Never mutate DOM a live editor owns (issue #33): ProseMirror reverts foreign
+        // mutations, re-firing our observer into an infinite loop. WRITING_SEL alone is
+        // brittle (the testid can change), so we detect editors by their nature. Not a
+        // bare [contenteditable]: that matches contenteditable="false" widgets too.
         var EDITOR_SEL = WRITING_SEL + ', [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .ProseMirror, [role="textbox"]';
 
-        // --- NATIVE RTL INTEROP (claude.ai "alluvium" renderer, 2026) ---
+        // --- NATIVE RTL INTEROP (claude.ai "alluvium" renderer) ---
+        // claude.ai stamps dir="rtl|ltr" on markdown blocks natively (first-strong over
+        // the first 80 chars incl. inline code/URLs; lists by first item, tables by first
+        // header cell). Cells, list items, user messages, inputs and UI chrome get none.
         //
-        // claude.ai now stamps dir="rtl|ltr" on markdown blocks natively (Code
-        // tab today; a chat renderer with the same logic sits disabled in the
-        // bundle). Their detector is first-strong over the first 80 chars,
-        // INCLUDING inline code/URLs; lists are judged by their first item
-        // only, tables by their first header cell only. Cells, list items,
-        // user messages, inputs and UI chrome get no native dir at all.
-        //
-        // Ownership rule: every dir the patch sets carries MANAGED_FLAG. A dir
-        // WITHOUT the flag is native -- it is NEVER removed or reset (React
-        // re-stamps it on each streaming re-render; fighting it garbles the
-        // page). The patch overrides a native dir only via the code-aware
-        // confident layers, and freely fills every gap native leaves.
+        // Ownership rule: every dir the patch sets carries MANAGED_FLAG. A dir WITHOUT it
+        // is native and is NEVER removed or reset (React re-stamps on each re-render;
+        // fighting it garbles the page). The patch overrides native dir only via the
+        // code-aware confident layers, and freely fills the gaps native leaves.
         var MANAGED_FLAG = 'data-rtl-managed';
         var NATIVE_DIR_SEL = '[dir]:not([' + MANAGED_FLAG + '])';
-        // Streaming markdown host: frontier blocks re-render continuously
-        // while streaming, so structural work (math islands) waits for quiet.
+        // Streaming markdown host: frontier blocks re-render continuously, so structural
+        // work (math islands) waits for quiet.
         var STREAM_HOST_SEL = '[data-alluvium]';
 
         function isNativeDir(el) {
             return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
         }
 
-        // True when el sits under a native-dir'd ancestor (or is one itself).
-        // <html>/<body> are excluded: on a Hebrew-locale OS claude.ai stamps
-        // dir="rtl" on the ROOT element -- a page-wide default, not a per-block
-        // decision -- and treating it as native ownership would turn every
-        // guard into a global no-op.
+        // True when el sits under a native-dir'd ancestor (or is one). <html>/<body> are
+        // excluded: on a Hebrew-locale OS claude.ai stamps dir="rtl" on the ROOT (a
+        // page-wide default), and treating that as native ownership no-ops every guard.
         function inNativeDirSubtree(el) {
             var host = el.closest ? el.closest(NATIVE_DIR_SEL) : null;
             return !!(host && host !== document.documentElement && host !== document.body);
@@ -146,18 +122,15 @@ $RTL_INJECTION_CODE = @'
         // --- PURE DETECTION CORE (inlined from src/rtl-core.js by build-payload.ps1) ---
         // rtl-core.js -- pure, DOM-free RTL/LaTeX detection logic.
 //
-// SOURCE OF TRUTH for the detection engine. tools/build-payload.ps1 inlines the
-// function bodies of this file into the injected IIFE inside patch.ps1 (it strips
-// the module.exports guard at the bottom). test/rtl-core.test.js requires this
-// file directly. Keep this file DOM-free so it stays unit-testable.
+// SOURCE OF TRUTH for the detection engine. tools/build-payload.ps1 inlines this
+// file into the injected IIFE inside patch.ps1 (stripping the module.exports guard
+// at the bottom); test/rtl-core.test.js requires it directly. Keep it DOM-free.
 'use strict';
 
-// Strong-RTL code-point ranges, [lo, hi] inclusive. Covers the modern living
-// RTL scripts plus the common historic/astral ones, and the explicit RTL bidi
-// control characters (RLM/RLE/RLO/RLI) -- a text whose author forced RTL via a
-// control mark IS strong-RTL (parity with claude.ai's native detector, which
-// treats U+200F/U+202B/U+202E as RTL). Tested against code points
-// (codePointAt), NOT UTF-16 code units, so astral blocks like Adlam work.
+// Strong-RTL code-point ranges, [lo, hi] inclusive. Covers living RTL scripts plus
+// common historic/astral ones and the explicit RTL bidi controls (RLM/RLE/RLO/RLI),
+// matching claude.ai's native detector. Tested against code points (codePointAt),
+// not UTF-16 code units, so astral blocks like Adlam work.
 var RTL_RANGES = [
     [0x0590, 0x05FF], // Hebrew
     [0x0600, 0x06FF], // Arabic
@@ -186,7 +159,6 @@ var RTL_RANGES = [
     [0x1EE00, 0x1EEFF]  // Arabic Mathematical Alphabetic Symbols
 ];
 
-// cp: a Unicode code point (from String.prototype.codePointAt).
 function isRTL(cp) {
     for (var i = 0; i < RTL_RANGES.length; i++) {
         if (cp >= RTL_RANGES[i][0] && cp <= RTL_RANGES[i][1]) return true;
@@ -210,18 +182,16 @@ function firstStrong(text) {
     for (var i = 0; i < text.length;) {
         var cp = text.codePointAt(i);
         if (isRTL(cp)) return 'rtl';
-        // ASCII Latin letters are strong-LTR (matches the original /[a-zA-Z]/ rule).
+        // ASCII Latin letters are strong-LTR.
         if ((cp >= 0x41 && cp <= 0x5A) || (cp >= 0x61 && cp <= 0x7A)) return 'ltr';
         i += cp > 0xFFFF ? 2 : 1;
     }
     return null;
 }
 
-// Majority script over the text: strong-RTL code points vs Latin letters.
-// The last-resort tie-breaker: when first-strong (even after stripping leading
-// LTR noise) says LTR but RTL characters do exist, majority decides. An
-// English sentence that merely quotes a Hebrew word stays LTR, while a Hebrew
-// paragraph opening with an unstripped Latin run still flips RTL.
+// Majority script: strong-RTL code points vs Latin letters. Last-resort tie-breaker
+// when first-strong says LTR but RTL characters exist -- an English sentence quoting
+// a Hebrew word stays LTR; a Hebrew paragraph opening with a Latin run flips RTL.
 function rtlMajority(text) {
     if (!text) return false;
     var r = 0, l = 0;
@@ -234,8 +204,8 @@ function rtlMajority(text) {
     return r > l;
 }
 
-// Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a
-// Hebrew sentence that starts with "foo.js" still detects as RTL.
+// Remove leading LTR-only noise (filenames, URLs, paths, backtick-code) so a Hebrew
+// sentence that starts with "foo.js" still detects as RTL.
 function stripLeadingLTR(text) {
     return text
         .replace(/^[\s]*(?:[\w.\-]+\.[\w]{1,5})\s*/g, '')
@@ -244,17 +214,16 @@ function stripLeadingLTR(text) {
         .replace(/`[^`]+`/g, '');
 }
 
-// A "$...$" body is treated as math only when it carries a real LaTeX signal.
-// This is the currency guard: "$5.99" or "$5 to $10" lack the signal and stay text.
+// A "$...$" body is math only with a real LaTeX signal (currency guard: "$5.99" stays text).
 var LATEX_SIGNAL = /[\\^_{}]|\b(?:frac|sqrt|sum|prod|int|lim|infty|cdot|times|div|leq|geq|neq|approx|partial|nabla|alpha|beta|gamma|delta|theta|lambda|mu|pi|sigma|omega|matrix|begin|end|left|right|text|mathbb|mathcal|vec|hat|bar|overline|underline)\b/;
 
 function hasLatexSignal(body) {
     return LATEX_SIGNAL.test(body);
 }
 
-// Find math regions as [start, end) index pairs over `text`.
-// Unambiguous delimiters ($$...$$, \[...\], \(...\)) always count; single $...$
-// only counts with a LaTeX signal and only outside already-claimed regions.
+// Find math regions as [start, end) index pairs. Unambiguous delimiters
+// ($$...$$, \[...\], \(...\)) always count; single $...$ only with a LaTeX signal
+// and only outside already-claimed regions.
 function findLatexRanges(text) {
     var ranges = [];
     if (!text) return ranges;
@@ -280,66 +249,56 @@ function findLatexRanges(text) {
         return false;
     }
 
-    // Order matters: claim the unambiguous, greedier delimiters first.
+    // Claim the unambiguous, greedier delimiters first.
     claim(/\$\$[\s\S]+?\$\$/g, false, 0, 0);
     claim(/\\\[[\s\S]+?\\\]/g, false, 0, 0);
     claim(/\\\([\s\S]+?\\\)/g, false, 0, 0);
-    // Single $...$ -- no newline inside, must carry a LaTeX signal (currency guard).
-    claim(/\$[^$\n]+?\$/g, true, 1, 1);
+    claim(/\$[^$\n]+?\$/g, true, 1, 1); // single $...$: no newline, must carry a LaTeX signal
 
     ranges.sort(function (a, b) { return a[0] - b[0]; });
     return ranges;
 }
 
 // --- BARE NUMERIC / ARITHMETIC ISOLATION ---
+// Claude often writes arithmetic without LaTeX delimiters ("2 + 3 = 5"); inside an
+// RTL paragraph the bidi algorithm mirrors it to "5 = 3 + 2". findMathRanges marks
+// such runs so the DOM can isolate them LTR.
 //
-// Claude frequently writes arithmetic WITHOUT LaTeX delimiters, e.g. a Hebrew
-// sentence containing "2 + 3 = 5". Inside an RTL paragraph the Unicode bidi
-// algorithm lays the number+operator tokens out right-to-left, so it renders
-// mirrored as "5 = 3 + 2". findMathRanges marks such runs so the DOM can isolate
-// LTR -- the same fix findLatexRanges applies to "$...$", extended to bare math.
-//
-// Operator characters whose PRESENCE proves a run is a genuine expression (not a
-// lone number, date, IP, version, or list marker). ASCII core plus common
-// Unicode math (multiply, divide, minus-sign, <=, >=, !=, ~=, arrow, dots,
-// root). Built with String.fromCharCode so the SOURCE stays pure ASCII -- the
-// patch.ps1 this is inlined into is a BOM-less .ps1, and PowerShell 5.1 corrupts
-// non-ASCII source bytes. The '-' is escaped so the string is a safe regex class
-// body. Order/codes: U+00D7 U+00F7 U+00B1 U+2212 U+2264 U+2265 U+2260 U+2248
-// U+2192 U+00B7 U+2022 U+2219 U+2217 U+22C5 U+221A.
+// Operator characters proving a run is a genuine expression. Built with
+// String.fromCharCode so the SOURCE stays pure ASCII (patch.ps1 is BOM-less and
+// PowerShell 5.1 corrupts non-ASCII source bytes); '-' is escaped for the regex
+// class. Codes: U+00D7 U+00F7 U+00B1 U+2212 U+2264 U+2265 U+2260 U+2248 U+2192
+// U+00B7 U+2022 U+2219 U+2217 U+22C5 U+221A.
 var MATH_OP_CHARS = '+\\-*/=<>%' + String.fromCharCode(
     0xD7, 0xF7, 0xB1, 0x2212, 0x2264, 0x2265, 0x2260,
     0x2248, 0x2192, 0xB7, 0x2022, 0x2219, 0x2217, 0x22C5, 0x221A);
 var MATH_OP_RE  = new RegExp('[' + MATH_OP_CHARS + ']');
 var MATH_DIGIT_RE = /[0-9]/;
-// A whitespace-delimited token is "mathy" when built only from digits and math
-// punctuation/operators, OR it is a single Latin letter used as a variable
-// (x, y, n). Multi-letter Latin tokens (English words, "3D", "4K") are NOT
-// mathy, so they break a run and keep prose out of the isolated island.
+// A token is "mathy" when built only from digits and math punctuation/operators, OR
+// it is a single Latin variable letter (x, y, n). Multi-letter Latin tokens (words,
+// "3D", "4K") break a run and keep prose out of the island.
 var MATH_TOKEN_RE = new RegExp('^(?:[0-9.,:;()\\[\\]{}|' + MATH_OP_CHARS + ']+|[A-Za-z])$');
 
 function isMathyToken(tok) {
     return !!tok && MATH_TOKEN_RE.test(tok);
 }
 
-// A token may BOUND a run only if it carries an operand -- a digit or a single
-// Latin variable letter. Pure operator/punctuation tokens ("+", "=", "(") can
-// sit inside a run but never start or end it (avoids dangling "+ 3").
+// A token may BOUND a run only if it carries an operand (a digit or single Latin
+// variable letter). Pure operator/punctuation tokens sit inside but never bound it.
 function isOperandToken(tok) {
     return MATH_DIGIT_RE.test(tok) || /^[A-Za-z]$/.test(tok);
 }
 
-// Find bare numeric/arithmetic runs as [start, end) index pairs over `text`.
-// A run must be whitespace/line delimited, operand-bounded, and contain at least
-// one digit AND one operator. Lone numbers, "$5" currency, Hebrew-glued
-// constructs (a prefix letter joined to a number with no space), dates/IPs
-// without operators, and "1." list markers are deliberately left alone.
+// Find bare numeric/arithmetic runs as [start, end) pairs. A run must be
+// whitespace/line delimited, operand-bounded, and contain a digit AND an operator.
+// Lone numbers, "$5", Hebrew-glued constructs, dates/IPs, and "1." list markers are
+// left alone.
 function findMathRanges(text) {
     var ranges = [];
     if (!text || !MATH_OP_RE.test(text) || !MATH_DIGIT_RE.test(text)) return ranges;
 
-    // Scan line by line so a run never spans a newline (each line is its own
-    // bidi paragraph). `base` is the absolute offset of the current line.
+    // Scan line by line so a run never spans a newline (each line is its own bidi
+    // paragraph). `base` is the absolute offset of the current line.
     var base = 0;
     var lines = text.split('\n');
     for (var li = 0; li < lines.length; li++) {
@@ -350,7 +309,7 @@ function findMathRanges(text) {
 
     function scanLine(line, off) {
         var toks = [];
-        var re = /\S+/g; // non-whitespace tokens; \s breaks them
+        var re = /\S+/g;
         var m;
         while ((m = re.exec(line)) !== null) {
             toks.push({ v: m[0], start: m.index, end: m.index + m[0].length });
@@ -360,16 +319,14 @@ function findMathRanges(text) {
             if (!isMathyToken(toks[i].v)) { i++; continue; }
             var j = i;
             while (j + 1 < toks.length && isMathyToken(toks[j + 1].v)) j++;
-            // toks[i..j] is a maximal mathy group. Trim non-operand tokens off
-            // both ends so the isolated run is operand-bounded.
+            // Trim non-operand tokens off both ends so the run is operand-bounded.
             var a = i, b = j;
             while (a <= b && !isOperandToken(toks[a].v)) a++;
             while (b >= a && !isOperandToken(toks[b].v)) b--;
             if (a <= b) {
                 var s = off + toks[a].start;
                 var e = off + toks[b].end;
-                // Drop sentence punctuation that clung to the ends (never part of
-                // a real number at a boundary: a decimal never ends in '.').
+                // Drop sentence punctuation clinging to the ends.
                 while (e > s && '.,:;'.indexOf(text.charAt(e - 1)) !== -1) e--;
                 while (e > s && ',:;'.indexOf(text.charAt(s)) !== -1) s++;
                 var sub = text.slice(s, e);
@@ -383,8 +340,8 @@ function findMathRanges(text) {
 }
 
 // Split text into alternating {type:'text'|'math', value} segments. 'math' covers
-// both LaTeX islands (findLatexRanges) and bare arithmetic (findMathRanges); the
-// DOM layer isolates both LTR. LaTeX wins when the two overlap.
+// LaTeX islands and bare arithmetic; the DOM layer isolates both LTR. LaTeX wins
+// when the two overlap.
 function segmentText(text) {
     var segs = [];
     if (!text) return segs;
@@ -414,24 +371,22 @@ function segmentText(text) {
     return segs;
 }
 
-// Classify a table cell's direction from its text. A cell counts as RTL if it
-// *contains* any RTL character -- not merely if its first strong char is RTL.
-// Header labels often start with a Latin term ("blob ...", "ID ...") yet belong
-// to a Hebrew column, so first-strong is too weak here. Neutral cells (digits,
-// hashes, punctuation only) return null so they do not sway the majority.
+// Classify a table cell's direction. A cell is RTL if it *contains* any RTL char
+// (header labels often start with a Latin term yet belong to a Hebrew column, so
+// first-strong is too weak here). Neutral cells return null so they don't sway
+// the majority.
 function cellDir(text) {
     if (hasRTL(text)) return 'rtl';
     if (firstStrong(text) === 'ltr') return 'ltr';
     return null;
 }
 
-// Decide a whole table's column direction from header / first-column cell dirs.
-// Each input is an array of 'rtl' | 'ltr' | null. Header wins; first column is
-// the tie-breaker. Returns 'rtl' (flip columns) or null (leave LTR).
+// Decide a table's column direction from header / first-column cell dirs (each an
+// array of 'rtl'|'ltr'|null). Header wins; first column is the tie-breaker.
+// Returns 'rtl' (flip columns) or null (leave LTR).
 function tableDirFromCells(headerDirs, firstColDirs) {
-    // First header is the semantic key column (row labels). If it's RTL and the
-    // first data cell agrees, the table is a Hebrew table regardless of how many
-    // product/entity names appear as LTR in subsequent headers.
+    // First header is the semantic key column: if it and the first data cell are
+    // both RTL, it's a Hebrew table regardless of Latin names in later headers.
     if (headerDirs && headerDirs[0] === 'rtl' &&
             firstColDirs && firstColDirs[0] === 'rtl') return 'rtl';
     var h = majorityDir(headerDirs || []);
@@ -453,7 +408,7 @@ function majorityDir(dirs) {
 }
         // --- END PURE DETECTION CORE ---
 
-        // Get text from element excluding <code> children (DOM-aware)
+        // Text of an element excluding <code>/<pre> children.
         function textWithoutCode(el) {
             var out = '';
             var nodes = el.childNodes;
@@ -468,12 +423,9 @@ function majorityDir(dirs) {
         }
 
         // --- PER-LINE DIRECTIONAL SPLITTING ---
-        //
-        // A paragraph rendered with <br> separators or whitespace-pre may carry
-        // multiple lines, each in a different script. Forcing a single dir on the
-        // host element mangles every line that disagrees. We instead defer to
-        // unicode-bidi:plaintext and stamp data-rtl-split so later passes skip it.
-
+        // A paragraph with <br>/newline separators may carry multiple lines in different
+        // scripts; forcing one dir mangles the disagreeing lines. We defer to
+        // unicode-bidi:plaintext and flag data-rtl-split so later passes skip it.
         var RTL_SPLIT_FLAG = 'data-rtl-split';
         var BR_OR_NL_SPLIT = /(<br\s*\/?>|\n)/i;
 
@@ -487,25 +439,19 @@ function majorityDir(dirs) {
 
         function splitToDirectionalSpans(el) {
             if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
-            // No DOM rewriting -- assigning el.innerHTML broke React reconciliation
-            // ("Failed to execute 'removeChild' on 'Node'"). Defer to
-            // unicode-bidi:plaintext: <br> is a paragraph separator in the Unicode
-            // BiDi algorithm, so each line auto-picks its direction from first-strong.
+            // No DOM rewriting -- assigning innerHTML broke React reconciliation. Defer to
+            // unicode-bidi:plaintext: each line (a bidi paragraph) auto-picks its direction
+            // from first-strong. Only a patch-owned dir may be removed; a native dir stays
+            // (plaintext neutralizes it anyway).
             el.setAttribute(RTL_SPLIT_FLAG, '1');
-            // Only a patch-owned dir may be removed. A NATIVE dir stays put
-            // (ownership rule); unicode-bidi:plaintext neutralizes it anyway,
-            // because plaintext resolves each line from its own first-strong
-            // character regardless of the element's dir attribute.
             if (!isNativeDir(el)) unstampDir(el);
             el.style.direction = '';
             el.style.textAlign = 'start';
             el.style.unicodeBidi = 'plaintext';
         }
 
-        // If the element inherits RTL via a parent CSS class (not an explicit dir
-        // attribute on itself), removing dir alone won't free it -- pin direction=ltr.
-        // NEVER touches a native dir: deleting one re-ignites the React re-stamp
-        // fight that garbled the Code tab (the original merge conflict).
+        // If RTL is inherited via a parent CSS class (not an explicit dir on the element),
+        // removing dir alone won't free it -- pin direction=ltr. Never touches a native dir.
         function resetDirOrPinLTR(el) {
             if (isNativeDir(el)) return;
             if (window.getComputedStyle(el).direction === 'rtl') {
@@ -517,30 +463,28 @@ function majorityDir(dirs) {
 
         // --- HYBRID DIRECTION DETECTION ---
 
-        // For DOM elements (output): 3-layer detection
+        // For DOM elements (output): 3-layer detection.
         function detectElDir(el) {
             var full = el.textContent || '';
             if (!hasRTL(full)) return null;
 
-            // Layer 1: first-strong on text excluding <code> children
+            // Layer 1: first-strong on text excluding <code> children.
             var noCode = textWithoutCode(el);
             var d = firstStrong(noCode);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 2: strip leading filenames/URLs, then first-strong
+            // Layer 2: strip leading filenames/URLs, then first-strong.
             var stripped = stripLeadingLTR(noCode);
             d = firstStrong(stripped);
             if (d === 'rtl') return 'rtl';
 
-            // Layer 3: RTL chars exist but first-strong still says LTR even
-            // after stripping -- majority script decides. An English paragraph
-            // quoting a single Hebrew word stays LTR; a Hebrew-dominant block
-            // whose Latin prefix survived the strip still flips RTL.
+            // Layer 3: RTL chars exist but first-strong still says LTR after stripping --
+            // majority script decides.
             return rtlMajority(noCode) ? 'rtl' : null;
         }
 
-        // Majority first-strong over a list's items: confident enough to
-        // overrule a native list dir, which is judged by the FIRST item only.
+        // Majority first-strong over a list's items: confident enough to overrule a native
+        // list dir (which is judged by the FIRST item only).
         function listConfidentDir(el) {
             var dirs = [];
             for (var i = 0; i < el.children.length; i++) {
@@ -554,7 +498,7 @@ function majorityDir(dirs) {
             return majorityDir(dirs);
         }
 
-        // For plain text (input box, dialogs without DOM structure)
+        // For plain text (input box, dialogs without DOM structure).
         function detectTextDir(text) {
             if (!text || !text.trim()) return null;
             var d = firstStrong(text);
@@ -570,7 +514,7 @@ function majorityDir(dirs) {
 
         // --- ELEMENT PROCESSING ---
 
-        // querySelectorAll that INCLUDES root itself if it matches
+        // querySelectorAll that INCLUDES root itself if it matches.
         function qsa(root, sel) {
             var base = root.querySelectorAll ? root : document;
             var els = Array.from(base.querySelectorAll(sel));
@@ -579,8 +523,8 @@ function majorityDir(dirs) {
         }
 
         function forceCodeLTR(root) {
-            // Inside editors the injected stylesheet already pins pre/code/katex
-            // LTR; stamping here would fight ProseMirror (issue #33).
+            // Inside editors the stylesheet already pins pre/code/katex LTR; stamping here
+            // would fight ProseMirror (issue #33).
             qsa(root, 'pre, .code-block__code, .relative.group\\/copy').forEach(function(b) {
                 if (b.closest(EDITOR_SEL)) return;
                 stampDir(b, 'ltr'); b.style.textAlign = 'left'; b.style.unicodeBidi = 'embed';
@@ -589,7 +533,6 @@ function majorityDir(dirs) {
                 if (c.closest(EDITOR_SEL)) return;
                 if (!c.closest('pre') && !c.closest('.code-block__code')) stampDir(c, 'ltr');
             });
-            // Rendered math (KaTeX/MathJax), if present, is an LTR island too.
             qsa(root, '.katex, .katex-display, mjx-container').forEach(function(m) {
                 if (m.closest(EDITOR_SEL)) return;
                 m.style.unicodeBidi = 'isolate'; m.style.direction = 'ltr';
@@ -597,22 +540,15 @@ function majorityDir(dirs) {
         }
 
         // --- RAW LaTeX + BARE-ARITHMETIC ISOLATION ---
-        //
-        // Claude Desktop (Windows) does not render LaTeX -- it shows raw "$...$" text.
-        // Inside an RTL paragraph the neutral $ \ { } chars scramble the formula, and
-        // bare arithmetic ("2 + 3 = 5", "5-3", "x = 10") gets mirrored to "5 = 3 + 2"
-        // by the bidi algorithm. We isolate each math segment (LaTeX or bare numeric,
-        // per segmentText) in its own ltr/unicode-bidi:isolate span. We replace a
-        // single TEXT node with a fragment (replaceChild) -- never innerHTML -- to stay
-        // gentle on React reconciliation, and flag islands so we never re-wrap during
-        // streaming.
+        // Claude Desktop (Windows) shows raw "$...$" text, and inside an RTL paragraph the
+        // neutral $ \ { } chars scramble formulas while bare arithmetic gets mirrored. We
+        // isolate each math segment (per segmentText) in its own ltr/isolate span via
+        // replaceChild -- never innerHTML -- to stay gentle on React, flagging islands so
+        // we never re-wrap during streaming.
         var ISLAND_FLAG = 'data-rtl-island';
 
-        // While a streaming markdown host is actively mutating, its frontier
-        // blocks are re-rendered wholesale -- any replaceChild we do there is
-        // clobbered and redone every tick (visible churn). Islands inside a
-        // stream host wait for a quiet window; the observer schedules a settle
-        // pass that catches up once streaming pauses/ends.
+        // While a stream host is actively mutating, replaceChild is clobbered each tick.
+        // Islands there wait for a quiet window; the observer schedules a catch-up pass.
         var lastStreamMut = 0;
         var STREAM_QUIET_MS = 500;
 
@@ -629,22 +565,17 @@ function majorityDir(dirs) {
                 acceptNode: function(node) {
                     var v = node.nodeValue;
                     if (!v) return NodeFilter.FILTER_REJECT;
-                    // Cheap pre-filter: a LaTeX hint ($ or \), OR a numeric hint
-                    // (a digit AND an operator). MATH_DIGIT_RE / MATH_OP_RE come from
-                    // the inlined core above and are stateless (no /g flag).
+                    // Cheap pre-filter: a LaTeX hint ($ or \) OR a numeric hint (digit AND operator).
                     var hasTex = v.indexOf('$') !== -1 || v.indexOf('\\') !== -1;
                     var hasNum = MATH_DIGIT_RE.test(v) && MATH_OP_RE.test(v);
                     if (!hasTex && !hasNum) return NodeFilter.FILTER_REJECT;
                     var p = node.parentElement;
                     if (!p) return NodeFilter.FILTER_REJECT;
                     if (p.tagName === 'SCRIPT' || p.tagName === 'STYLE') return NodeFilter.FILTER_REJECT;
-                    // EDITOR_SEL, not WRITING_SEL: replaceChild on a text node
-                    // the user is typing into is the most violent mutation an
-                    // editor can receive -- "-" then a digit passes the numeric
-                    // pre-filter above and ignited the issue #33 freeze loop.
+                    // EDITOR_SEL (not WRITING_SEL): replaceChild on a text node the user is
+                    // typing into ignited the issue #33 freeze loop.
                     if (p.closest('pre, code, .code-block__code, [' + ISLAND_FLAG + '], ' + EDITOR_SEL)) return NodeFilter.FILTER_REJECT;
-                    // Streaming frontier: defer to the settle pass.
-                    if (inActiveStream(p)) return NodeFilter.FILTER_REJECT;
+                    if (inActiveStream(p)) return NodeFilter.FILTER_REJECT; // defer to settle pass
                     return NodeFilter.FILTER_ACCEPT;
                 }
             });
@@ -674,22 +605,17 @@ function majorityDir(dirs) {
         }
 
         // --- TABLE COLUMN ORDERING ---
-        //
-        // A Hebrew table should read right-to-left: the first column on the right.
-        // Per-cell direction is handled by processText; here we only flip the whole
-        // table's column order via dir="rtl" on a stable <table> element (no text
-        // surgery, low risk). Only flip once we are confident it is a Hebrew table;
-        // leave the flag off otherwise so a table still streaming can re-evaluate.
+        // A Hebrew table should read RTL (first column on the right). Per-cell direction is
+        // handled by processText; here we only flip column order via dir="rtl" on a stable
+        // <table>, and only once confident it's a Hebrew table.
         var TABLE_FLAG = 'data-rtl-table';
 
         function processTables(root) {
             qsa(root, 'table').forEach(function(t) {
                 if (t.getAttribute(TABLE_FLAG) === 'rtl') return;
                 if (t.closest(EDITOR_SEL)) return;
-                // Native flip: claude.ai stamps dir on the table's WRAPPER div
-                // (judged by the first header cell only). If the columns are
-                // already flowing RTL under a native dir, adopt it -- the flip
-                // happened, only per-cell work (processText) remains.
+                // Native flip: claude.ai stamps dir on the table's wrapper div. If columns
+                // already flow RTL under a native dir, adopt it -- only per-cell work remains.
                 if (inNativeDirSubtree(t) && getComputedStyle(t).direction === 'rtl') {
                     t.setAttribute(TABLE_FLAG, 'rtl');
                     return;
@@ -707,9 +633,7 @@ function majorityDir(dirs) {
                     return cell ? cellDir(cell.textContent || '') : null;
                 });
                 if (tableDirFromCells(headerDirs, firstColDirs) === 'rtl') {
-                    // Native missed this one (e.g. Latin-first header cell on a
-                    // Hebrew table). Flip the <table> itself -- stamped, never
-                    // the native wrapper.
+                    // Native missed this one -- flip the <table> itself (stamped, never the wrapper).
                     t.setAttribute(TABLE_FLAG, 'rtl');
                     stampDir(t, 'rtl');
                 }
@@ -722,22 +646,15 @@ function majorityDir(dirs) {
                 if (el.closest(EDITOR_SEL) || el.closest('pre') || el.closest('.code-block__code')) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 if (isNativeDir(el)) {
-                    // Native already directed this block. Add only what native
-                    // cannot express; never remove or downgrade its dir.
-                    //
-                    // Multi-script lines first, for EITHER native dir: native
-                    // gives the whole block one dir from its first 80 chars,
-                    // so a Hebrew quote whose first line is a Latin marker
-                    // ("[!IMPORTANT]<br>...") gets ltr and every Hebrew line
-                    // below renders backwards. plaintext resolves each line
-                    // independently and leaves the native dir attribute alone.
+                    // Native already directed this block. Add only what native cannot
+                    // express; never remove or downgrade its dir. Multi-script lines first,
+                    // for either native dir: native gives the whole block one dir, so a
+                    // Hebrew quote whose first line is a Latin marker renders backwards.
                     if (hasRTL(el.textContent || '') && hasMultiScriptLines(el)) {
                         splitToDirectionalSpans(el);
                     } else if (el.getAttribute('dir') !== 'rtl' &&
                                detectElDir(el) === 'rtl') {
-                        // Disagreement (code-prefixed or Latin-first Hebrew):
-                        // override. Safe now that layer 3 requires an RTL
-                        // majority rather than a single RTL character.
+                        // Disagreement (code-prefixed or Latin-first Hebrew): override.
                         stampDir(el, 'rtl');
                     }
                     if (el.getAttribute('dir') === 'rtl' && el.tagName === 'LI') {
@@ -771,8 +688,8 @@ function majorityDir(dirs) {
             qsa(root, 'ul, ol').forEach(function(el) {
                 if (el.closest(EDITOR_SEL) || el.closest('pre')) return;
                 if (isNativeDir(el)) {
-                    // Native judges a list by its FIRST item only. Overrule
-                    // its ltr only on a confident majority of item dirs.
+                    // Native judges a list by its FIRST item only. Overrule ltr only on a
+                    // confident majority of item dirs.
                     if (el.getAttribute('dir') !== 'rtl' &&
                             listConfidentDir(el) === 'rtl') {
                         stampDir(el, 'rtl');
@@ -793,14 +710,12 @@ function majorityDir(dirs) {
             });
         }
 
-        // Universal: process ANY leaf text container (catches dialogs, tooltips, etc.)
+        // Universal: process ANY leaf text container (dialogs, tooltips, etc.)
         function processContainers(root) {
             qsa(root, 'div, span, button, a, label').forEach(function(el) {
                 if (el.closest('pre') || el.closest('code') || el.closest(EDITOR_SEL)) return;
-                // A subtree under NATIVE direction control is native's problem
-                // space: its inline spans are React-owned and the block-level
-                // dir already resolves them. Poking spans there re-fights the
-                // renderer for zero visual gain.
+                // A subtree under native dir control is native's problem space: its inline
+                // spans are React-owned and the block dir already resolves them.
                 if (inNativeDirSubtree(el)) return;
                 if (el.hasAttribute(RTL_SPLIT_FLAG)) return;
                 if (el.hasAttribute(ISLAND_FLAG)) return;
@@ -858,9 +773,8 @@ function majorityDir(dirs) {
                 '.katex,.katex-display,mjx-container{unicode-bidi:isolate!important;direction:ltr!important}',
                 // Hebrew tables: flip column order; cells keep their own direction.
                 'table[dir="rtl"]{direction:rtl!important}',
-                // Scoped to patch-owned dirs: native-dir'd blocks (claude.ai
-                // "alluvium") have their own layout children (word-fade spans)
-                // that a blanket plaintext rule disturbs.
+                // Scoped to patch-owned dirs: native-dir'd blocks have their own layout
+                // children (word-fade spans) that a blanket plaintext rule disturbs.
                 '[data-rtl-managed][dir]{text-align:start!important}[data-rtl-managed][dir="rtl"]{direction:rtl!important}[data-rtl-managed][dir="ltr"]{direction:ltr!important}',
                 '[data-rtl-managed][dir]>*:not([dir]):not(pre):not(code):not(.code-block__code){unicode-bidi:plaintext;text-align:start}',
                 // RTL: flip sidebar truncation gradient to fade the LEFT edge (issue #7).
@@ -890,12 +804,9 @@ function majorityDir(dirs) {
             // Watch DOM changes (throttle, not debounce -- process DURING streaming)
             var pendingMuts = [];
 
-            // Structural loop-breaker (issue #33), independent of the per-element
-            // skip-guards: a freeze loop needs "editor mutation -> schedule ->
-            // write into editor -> editor mutation". Dropping editor-internal
-            // records at intake cuts that chain at its first link, so even a
-            // future missed guard degrades to a one-shot fight instead of a
-            // hang. Also skips rescheduling work on every keystroke burst.
+            // Structural loop-breaker (issue #33): a freeze loop needs "editor mutation ->
+            // schedule -> write into editor -> editor mutation". Dropping editor-internal
+            // records at intake cuts that chain at its first link.
             function mutInsideEditor(m) {
                 var t = m.target;
                 var el = (t && t.nodeType === 1) ? t : (t ? t.parentElement : null);
@@ -908,8 +819,8 @@ function majorityDir(dirs) {
                 return !!(el && el.closest && el.closest(STREAM_HOST_SEL));
             }
 
-            // One-shot settle pass: after a stream host goes quiet, run the
-            // deferred math isolation over it (islands skipped mid-stream).
+            // One-shot settle pass: after a stream host goes quiet, run the deferred math
+            // isolation over it (islands skipped mid-stream).
             var settleTimer = null;
             function scheduleStreamSettle() {
                 lastStreamMut = Date.now();
@@ -986,10 +897,8 @@ function majorityDir(dirs) {
     try {
         if (typeof document === 'undefined' || typeof localStorage === 'undefined') return;
         var FLAG_KEY = 'claude-rtl-patch-welcomed';
-        // Tie the welcome banner to the Claude Desktop version reported in the UA
-        // (e.g. "...Claude/1.3036.0 Chrome/..."). On every Claude release the
-        // version changes, the saved flag stops matching, and the banner shows
-        // once for the new version — no manual bump needed.
+        // Tie the banner to the Claude version in the UA, so it shows once per
+        // release (the saved flag stops matching) with no manual bump.
         var versionMatch = (navigator.userAgent || '').match(/Claude\/([\d.]+)/);
         var VERSION = versionMatch ? versionMatch[1] : '0';
         if (localStorage.getItem(FLAG_KEY) === VERSION) return;
@@ -1032,14 +941,11 @@ function majorityDir(dirs) {
 // --- CLAUDE PATCH WELCOME BANNER END ---
 '@
 
-# Main-process snippet (NOT renderer). Unlike $RTL_INJECTION_CODE, this runs in the
-# Electron main process. It forces Chromium's UI direction to LTR, which fixes the
-# native frame-peek/preview window jumping to the far left and the title-bar control
-# placement on Hebrew/RTL OS locales. Root cause: when the OS locale is RTL, Chromium
-# derives a RTL UI direction and draws native child windows with WS_EX_LAYOUTRTL
-# (X-axis mirroring); the app itself sets no UI direction, so this switch is the
-# override. Injected at the very top of the main entry (index.pre.js), before app
-# 'ready' fires. Kept tiny and DOM-free to avoid interfering with MCP startup (#14).
+# Main-process snippet (NOT renderer): forces Chromium's UI direction to LTR, fixing
+# the native preview window jumping left and title-bar control placement on RTL OS
+# locales (Chromium otherwise draws native child windows with WS_EX_LAYOUTRTL).
+# Injected at the top of the main entry (index.pre.js) before app 'ready'. Kept tiny
+# and DOM-free to avoid interfering with MCP startup (#14).
 $MAIN_INJECTION_CODE = @'
 // --- CLAUDE RTL MAIN PATCH START ---
 ;(function(){
@@ -1058,8 +964,7 @@ $MAIN_INJECTION_CODE = @'
 # -----------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # -----------------------------------------------------------------------------
-# Persistent log -- captures every patch run (including silent ones triggered by
-# the auto-update watcher) so failures can be diagnosed after the fact.
+# Persistent log -- captures every patch run (incl. silent auto-update runs).
 $global:PatchLogFile = Join-Path $env:ProgramData "ClaudeRtlPatch\patch.log"
 
 function Write-LogToFile($level, $msg) {
@@ -1080,13 +985,10 @@ function Write-Step($msg)    { Write-Host "`n► $msg" -ForegroundColor Magenta;
 function Write-Success($msg) { Write-Host "  [+] $msg" -ForegroundColor Green;   Write-LogToFile 'OK'   $msg }
 function Write-Warn($msg)    { Write-Host "  [!] $msg" -ForegroundColor Yellow;  Write-LogToFile 'WARN' $msg }
 
-# Pure Binary Search equivalent to Python's bytearray.find()
+# Pure Binary Search equivalent to Python's bytearray.find().
 function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
-    # Fast path: convert both arrays to ISO-8859-1 strings (1 byte ↔ 1 char, lossless
-    # for all 256 byte values) and delegate to String.IndexOf, which is implemented in
-    # native code. This replaces a nested PowerShell byte-by-byte loop that was the
-    # dominant silent period during patching (tens of MB × needle length in pure PS
-    # could take ~30–60s on claude.exe).
+    # Fast path: convert both arrays to byte-preserving ISO-8859-1 strings and delegate
+    # to native String.IndexOf, replacing a slow byte-by-byte PowerShell loop.
     if ($Needle -eq $null -or $Needle.Length -eq 0 -or $Haystack -eq $null -or $Haystack.Length -lt $Needle.Length) { return -1 }
     if ($StartIndex -lt 0) { $StartIndex = 0 }
     if ($StartIndex -gt ($Haystack.Length - $Needle.Length)) { return -1 }
@@ -1096,19 +998,11 @@ function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
     return $hayStr.IndexOf($needleStr, $StartIndex, [System.StringComparison]::Ordinal)
 }
 
-# Single-pass, chunked equivalent of "loop Find-Bytes until -1" that finds EVERY
-# occurrence of $Needle and reports percentage progress as it sweeps the haystack.
-# Two reasons this exists instead of looping Find-Bytes:
-#   1. Progress. Find-Bytes delegates to a single native String.IndexOf over the
-#      whole array -- an atomic call with no way to surface a percentage. Chunking
-#      lets us emit a "% scanned" tick between chunks.
-#   2. Speed. Find-Bytes converts the ENTIRE array to a string on every call and
-#      ignores $StartIndex, so looping it to find N matches did N+1 full 222 MB
-#      conversions -- the dominant silent stall during patching. Here each byte is
-#      converted once.
-# Chunks overlap by ($Needle.Length - 1) so a needle straddling a boundary is still
-# found; the "accept only if the match starts inside the primary region" rule below
-# keeps a boundary-straddling match from being counted twice.
+# Finds EVERY occurrence of $Needle, emitting percentage progress as it sweeps. Beats
+# looping Find-Bytes on two counts: it can tick "% scanned" between chunks, and it
+# converts each byte to a string once instead of re-converting the whole array per
+# match. Chunks overlap by ($Needle.Length - 1) so a boundary-straddling needle is
+# still found; matches are counted only in their primary region, never twice.
 function Find-AllBytesWithProgress {
     param(
         [byte[]]$Haystack,
@@ -1132,9 +1026,8 @@ function Find-AllBytesWithProgress {
         while ($true) {
             $rel = $chunk.IndexOf($needleStr, $from, [System.StringComparison]::Ordinal)
             if ($rel -eq -1) { break }
-            # Accept only matches whose start lies in this chunk's primary region
-            # [0, ChunkSize); a match starting in the trailing overlap belongs to the
-            # next chunk's primary region and is counted there -- never twice.
+            # Accept only matches starting in the primary region [0, ChunkSize); a match
+            # in the trailing overlap is counted by the next chunk instead.
             if ($rel -ge $ChunkSize) { break }
             $indices.Add($pos + $rel)
             $from = $rel + $Needle.Length
@@ -1157,27 +1050,21 @@ $global:RtlTaskName  = "ClaudeRtlPatchWatcher"
 
 # -----------------------------------------------------------------------------
 # TRUST-ANCHOR DIRECTORY HARDENING
-# The auto-update chain READS a pinned pubkey and later EXECUTES update.ps1 /
-# watcher.ps1 from $RtlStateDir WITH ELEVATION. Default C:\ProgramData ACLs let
-# BUILTIN\Users create files (and leave CREATOR OWNER full control), so a
-# standard user could pre-plant any of these files -- or the whole directory as
-# a junction -- before the first install, keep write access after the elevated
-# installer overwrites only the CONTENT (a content write resets neither owner
-# nor ACL), then have their planted script run as admin: a local privilege
-# escalation. Lock the directory to an explicit, non-inherited ACL owned by
-# Administrators (Administrators/SYSTEM full, Users read+execute), and
-# delete-then-recreate each sensitive file so a planted owner/ACL cannot survive.
+# The auto-update chain reads a pinned pubkey and EXECUTES update.ps1/watcher.ps1
+# from $RtlStateDir WITH ELEVATION. Default ProgramData ACLs let standard users
+# pre-plant these files (or the dir as a junction) and survive a content-only
+# rewrite -- a local privilege escalation. Lock the dir to an explicit,
+# non-inherited ACL (Administrators/SYSTEM full, Users read+execute) and
+# delete-then-recreate each sensitive file so a planted owner/ACL can't survive.
 function Protect-RtlStateDir {
-    # Returns $true ONLY if the directory is verified to be a real folder owned by
-    # Administrators, with inheritance disabled and no write access for Users.
-    # Callers MUST fail closed on $false -- writing an elevated-executed script
-    # (update.ps1 / watcher.ps1) or the pubkey pin into an unverified directory is
-    # the exact privilege-escalation this guards against.
+    # Returns $true ONLY if the dir is a real folder owned by Administrators, with
+    # inheritance disabled and no Users write. Callers MUST fail closed on $false:
+    # writing an elevated-executed script or the pubkey pin into an unverified
+    # directory is the exact escalation this guards against.
     $dir = $global:RtlStateDir
     try {
-        # A reparse point here is always an attack -- it redirects the elevated
-        # writes below to an attacker-chosen target. Drop the link only
-        # (Directory.Delete on a junction/symlink never touches its target).
+        # A reparse point here is always an attack (redirects the elevated writes to
+        # an attacker target). Drop the link only (never touches its target).
         if (Test-Path $dir) {
             $existing = Get-Item -LiteralPath $dir -Force
             if ($existing.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
@@ -1189,18 +1076,14 @@ function Protect-RtlStateDir {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
 
-        # Reclaim OWNERSHIP FIRST, then replace the DACL. A standard user who
-        # pre-created the directory owns it and can lock Administrators out of
-        # the ACL entirely; Set-Acl cannot recover from that (it never enables
-        # SeTakeOwnership), but takeown.exe does. icacls then strips inherited
-        # and planted ACEs (/inheritance:r) and installs an explicit ACL by SID
-        # (correct on localized Windows). These are the same in-box tools the
-        # patch already uses in Take-Ownership; cmd /c isolates their stderr.
+        # Reclaim OWNERSHIP FIRST (takeown -- Set-Acl can't, as it never enables
+        # SeTakeOwnership), then icacls strips inherited/planted ACEs and installs
+        # an explicit ACL by SID (correct on localized Windows). cmd /c isolates stderr.
         cmd.exe /c "takeown /F `"$dir`" /A >nul 2>&1"
         cmd.exe /c "icacls `"$dir`" /inheritance:r /grant:r `"*S-1-5-32-544:(OI)(CI)F`" `"*S-1-5-18:(OI)(CI)F`" `"*S-1-5-32-545:(OI)(CI)RX`" >nul 2>&1"
 
-        # VERIFY and FAIL CLOSED. Re-read state from disk -- never trust the tool
-        # exit codes -- and reject anything an attacker could still control.
+        # VERIFY and FAIL CLOSED: re-read state from disk (never trust tool exit
+        # codes) and reject anything an attacker could still control.
         $chk = Get-Item -LiteralPath $dir -Force
         if ($chk.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
             Write-Warn "State dir '$dir' is still a reparse point after cleanup -- refusing to trust it."
@@ -1232,10 +1115,8 @@ function Protect-RtlStateDir {
     }
 }
 
-# Deletes any existing (possibly pre-planted symlink/hardlink or attacker-owned)
-# file so the caller's fresh write inherits the locked directory ACL instead of a
-# planted file's owner/permissions. Call AFTER Protect-RtlStateDir has locked the
-# directory, so the freed slot cannot be re-planted before the write.
+# Deletes any existing (possibly pre-planted) file so the caller's fresh write
+# inherits the locked directory ACL. Call AFTER Protect-RtlStateDir locks the dir.
 function Remove-PlantedFile([string]$Path) {
     try {
         if (Test-Path -LiteralPath $Path) {
@@ -1286,24 +1167,11 @@ function Save-PatchState {
 }
 
 function Save-TrustedPubkey {
-    # Pins the maintainer's PUBLIC KEY (the full RSA blob, not just a fingerprint
-    # of it) to disk. The auto-update watcher loads this key directly and uses it
-    # to verify patch.ps1.sig itself — install.ps1 is never fetched or executed
-    # during auto-update. Storing the full key (instead of SHA-256 over the
-    # blob, as the V1 design did) closes two bypasses of the V1 scheme:
-    #   1. install.ps1 is unsigned. A V1 watcher fingerprint-matched only the
-    #      $ExpectedPubKey variable, then ran the rest of install.ps1 as admin.
-    #      A compromised repo could leave the pubkey untouched and ship a
-    #      malicious payload around it. V2 never executes install.ps1.
-    #   2. Regex extraction of $ExpectedPubKey is not equivalent to PowerShell's
-    #      parser (commented-out lines, multiple assignments, here-strings).
-    #      V2 reads the pubkey bytes from a local file, no parsing of remote
-    #      script content involved.
-    #
-    # The pubkey value arrives via the CLAUDE_RTL_TRUSTED_PUBKEY env var set by
-    # install.ps1 (first install) or by the watcher itself (subsequent
-    # re-registrations). Using the env var rather than a fresh download avoids
-    # a TOCTOU race where the repo could change between verification and pin.
+    # Pins the maintainer's full PUBLIC KEY blob to disk. The auto-update watcher
+    # verifies patch.ps1.sig directly against it and never executes install.ps1
+    # (unsigned), so a compromised repo can't ship a payload around an untouched
+    # pubkey. The value arrives via the CLAUDE_RTL_TRUSTED_PUBKEY env var (not a
+    # fresh download) to avoid a TOCTOU race between verification and pin.
     try {
         $pubB64 = $env:CLAUDE_RTL_TRUSTED_PUBKEY
         if (-not $pubB64) {
@@ -1312,8 +1180,7 @@ function Save-TrustedPubkey {
             return
         }
 
-        # Validate the blob is well-formed before pinning. A corrupt or
-        # truncated env var would poison the pin and break legitimate updates.
+        # Validate the blob before pinning; a corrupt env var would break updates.
         try {
             $pubJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($pubB64))
             $pubObj  = $pubJson | ConvertFrom-Json
@@ -1333,14 +1200,12 @@ function Save-TrustedPubkey {
         Remove-PlantedFile $pinPath
         [IO.File]::WriteAllText($pinPath, $pubB64, $utf8NoBom)
 
-        # Log a fingerprint so operators can cross-check against install.ps1 /
-        # the README without exposing the full key blob in the log.
+        # Log a fingerprint for out-of-band cross-checking, without exposing the key blob.
         $sha = [System.Security.Cryptography.SHA256]::Create().ComputeHash([Convert]::FromBase64String($pubB64))
         $fp  = ([BitConverter]::ToString($sha)).Replace('-', '').ToLower()
         Write-Log "Trusted pubkey pinned at $pinPath (sha256=$fp)"
 
-        # Clean up the V1 fingerprint-only file. Harmless leftover but the V2
-        # watcher no longer reads it; removing it avoids confusing future audits.
+        # Clean up the legacy V1 fingerprint-only file (no longer read).
         $legacyFpr = Join-Path $global:RtlStateDir 'trusted-pubkey.fpr'
         if (Test-Path $legacyFpr) {
             Remove-Item $legacyFpr -Force -ErrorAction SilentlyContinue
@@ -1352,14 +1217,11 @@ function Save-TrustedPubkey {
 }
 
 function Save-UpdateScript {
-    # Local helper at %ProgramData%\ClaudeRtlPatch\update.ps1 for the desktop
-    # "Update Claude RTL" shortcut. Mirrors the watcher's verify-then-elevate
-    # flow against the pinned pubkey. Manual updates bypass install.ps1 (which
-    # is unsigned and would otherwise be a code-execution path on a hijacked
-    # repo) -- the only network artifact trusted is patch.ps1 + its signature.
-    # Protect-RtlStateDir locks the directory (Administrators-owned, Users
-    # read+execute only) so this elevated-executed helper cannot be pre-planted
-    # or later rewritten by a standard user.
+    # Local helper (ProgramData\ClaudeRtlPatch\update.ps1) for the desktop "Update
+    # Claude RTL" shortcut. Mirrors the watcher's verify-then-elevate flow against
+    # the pinned pubkey, so the only trusted network artifact is patch.ps1 + its sig
+    # (never the unsigned install.ps1). Protect-RtlStateDir locks the dir so this
+    # elevated-executed helper can't be pre-planted or rewritten by a standard user.
     try {
         if (-not (Protect-RtlStateDir)) {
             Write-Warn "State dir could not be secured; refusing to write the verified-update helper."
@@ -1458,8 +1320,7 @@ if (-not $valid) {
     Pause-ThenExit 1
 }
 
-# Strip incoming BOM (we re-add UTF-8 BOM on write). PS 5.1 needs BOM to parse
-# Hebrew/box-drawing characters in patch.ps1.
+# Strip incoming BOM, re-add UTF-8 BOM on write (PS 5.1 needs it to parse patch.ps1).
 $tmpFile = Join-Path $env:TEMP "claude_rtl_patch.ps1"
 $content = [System.Text.Encoding]::UTF8.GetString($patchBytes)
 if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
@@ -1467,14 +1328,12 @@ if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $conte
 
 Write-Host "Patch verified ($($patchBytes.Length) bytes). Elevating..." -ForegroundColor Green
 
-# Pass the pinned pubkey as a -TrustedPubKey PARAMETER so the elevated child's
-# Save-TrustedPubkey sees the SAME trust anchor. An env var would NOT survive the
-# Start-Process -Verb RunAs UAC boundary. CLAUDE_RTL_AUTO=1 tells patch.ps1 to run
-# Install-Patch directly instead of showing the menu (the "1-click update" path).
+# Pass the pubkey as a -TrustedPubKey PARAMETER (env vars don't survive the UAC
+# boundary) so the child's Save-TrustedPubkey sees the same anchor. AUTO=1 runs
+# Install-Patch directly instead of the menu.
 $env:CLAUDE_RTL_AUTO = '1'
 
-# Elevate via UAC. patch.ps1's Auto mode pauses on Read-Host at the end, so
-# the user gets a chance to read the patch log before the window closes.
+# Elevate via UAC. Auto mode pauses on Read-Host at the end so the log is readable.
 Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
     -Verb RunAs `
     -ArgumentList @(
@@ -1495,14 +1354,12 @@ Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.e
 function Find-ClaudeDir {
     $pkg = Get-AppxPackage | Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' } | Select-Object -First 1
     if (-not $pkg) {
-        # UAC elevation can switch identity: a standard user elevating with a
-        # separate admin account gets that admin's (empty) per-user package
-        # list, so Claude registered to the invoking user is invisible (#34).
-        # -AllUsers requires admin, which auto-elevation guarantees by now.
+        # UAC elevation can switch identity: elevating with a separate admin account
+        # hides Claude registered to the invoking user (#34). -AllUsers (needs admin,
+        # which we have) recovers it.
         Try {
-            # SilentlyContinue: orphaned packages from deleted profiles emit
-            # per-entry errors that would otherwise abort the whole pipeline
-            # under the script-global ErrorActionPreference = Stop.
+            # SilentlyContinue: orphaned packages from deleted profiles emit per-entry
+            # errors that would abort the pipeline under ErrorActionPreference = Stop.
             $pkg = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue |
                 Where-Object { $_.Name -like '*Claude*' -and $_.InstallLocation -like '*WindowsApps*' -and (Test-Path $_.InstallLocation) } |
                 Sort-Object -Property { [version]$_.Version } -Descending |
@@ -1526,15 +1383,11 @@ function Find-ClaudeDir {
     return $null
 }
 
-# Detects the #34 identity-mismatch scenario: a standard user elevated with a
-# SEPARATE admin account's credentials, so this process runs as an identity
-# that doesn't own the Claude registration. Returns the console user's
-# DOMAIN\name only when BOTH hold: (a) the console user's SID differs from
-# ours (SID compare -- name strings for the SAME account can differ between
-# Win32_ComputerSystem.UserName and WindowsIdentity, e.g. Microsoft accounts),
-# and (b) Claude is NOT registered to our (elevated) identity. Returns $null
-# otherwise (including RDP/service sessions where the console user is absent
-# or unrelated -- an RDP admin with Claude registered fails check (b)).
+# Detects the #34 identity-mismatch: elevation with a separate admin account whose
+# identity doesn't own the Claude registration. Returns the console user's DOMAIN\name
+# only when BOTH hold: (a) its SID differs from ours (SID compare, since name strings
+# can differ for the same account), and (b) Claude is NOT registered to our identity.
+# $null otherwise (incl. RDP/service sessions).
 function Get-MismatchedConsoleUser {
     Try {
         $consoleUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
@@ -1589,25 +1442,14 @@ function Stop-ClaudeServices {
 function Test-FileLock([string]$Path, [string]$Access = 'Write') {
     <#
     .SYNOPSIS
-        Returns $true if the file can't be opened for the requested $Access, $false otherwise.
+        Returns $true if the file can't be opened for the requested $Access, else $false.
     .PARAMETER Access
-        'Read' for read-only operations (e.g. creating a backup); 'Write' for writes (default).
-        The probe must replicate EXACTLY what the real operation does, or it could green-light
-        a step that then fails (or falsely block one that would succeed).
-    .NOTES
-        The probe mirrors the real operations' sharing semantics:
-          * write probe (FileAccess.Write, FileShare.Read)  == [IO.File]::WriteAllBytes
-          * read  probe (FileAccess.Read,  FileShare.Read)  == [IO.File]::ReadAllBytes / Copy
-        FileMode.Open (never Create) keeps the probe non-destructive.
-
-        This replaces the old (FileAccess.ReadWrite, FileShare.None) probe, which was both:
-          - too strict on share: it reported LOCKED whenever ANY coexisting handle existed,
-            even a benign read-share handle from an AV/indexer scanning the 200+ MB claude.exe
-            right after boot — the false-positive behind issue #15; and
-          - mismatched on access: it demanded ReadWrite even for read-only backup steps.
-        FileShare.Read (not ReadWrite) is deliberate: WriteAllBytes itself uses FileShare.Read,
-        so a permissive FileShare.ReadWrite probe could pass while WriteAllBytes then fails
-        against a coexisting writer. Matching FileShare.Read keeps probe == real op.
+        'Read' for read-only ops (e.g. backups); 'Write' for writes (default). The probe
+        must match the real op EXACTLY. It mirrors WriteAllBytes/ReadAllBytes sharing
+        (FileAccess + FileShare.Read, FileMode.Open non-destructive). FileShare.Read (not
+        ReadWrite) is deliberate: WriteAllBytes uses FileShare.Read, so a looser probe
+        could pass while the real write fails. A stricter FileShare.None probe caused the
+        issue #15 false-positive (AV read-share handle read as LOCKED).
     #>
     if (-not (Test-Path $Path)) { return $false }
     try {
@@ -1653,10 +1495,9 @@ function Get-FileHolders([string]$Path) {
     } catch { return @() }
 }
 
-# Windows Restart Manager gives the AUTHORITATIVE list of processes/services holding a
-# file open — far more reliable than walking Get-Process module lists (Get-FileHolders),
-# which misses services and files held without a loaded module. Ported from
-# tools/claude-lock-diag.ps1. Advisory only: used to name holders in preflight errors.
+# Windows Restart Manager: authoritative list of processes/services holding a file
+# open (unlike Get-FileHolders, which misses services and module-less handles).
+# Advisory only -- names holders in preflight errors.
 $script:RmLockTypeLoaded = $false
 function Initialize-RmLockType {
     if ($script:RmLockTypeLoaded) { return $true }
@@ -1718,8 +1559,8 @@ public static class RmLock {
         $script:RmLockTypeLoaded = $true
         return $true
     } catch {
-        # A second Add-Type of the same type in one session throws "already exists" —
-        # treat that as success. Any other failure: degrade to no holder list (advisory).
+        # A repeat Add-Type of the same type throws "already exists" -- treat as success;
+        # any other failure degrades to no holder list (advisory).
         if ("$($_.Exception.Message)" -match 'already') { $script:RmLockTypeLoaded = $true; return $true }
         Write-Log "Restart Manager unavailable (holder names will be omitted): $($_.Exception.Message)"
         return $false
@@ -1757,7 +1598,7 @@ function Get-FileWriteStatus([string]$Path) {
     } catch [System.UnauthorizedAccessException] {
         return [pscustomobject]@{ Path = $Path; Name = $name; Status = 'DENIED'; Holders = (Get-FileLockers $Path) }
     } catch {
-        # IOException (sharing violation) and anything else → treat as locked.
+        # IOException (sharing violation) and anything else: treat as locked.
         return [pscustomobject]@{ Path = $Path; Name = $name; Status = 'LOCKED'; Holders = (Get-FileLockers $Path) }
     }
 }
@@ -1765,18 +1606,15 @@ function Get-FileWriteStatus([string]$Path) {
 function Assert-PatchWritable {
     <#
     .SYNOPSIS
-        PREFLIGHT: before touching ANY file content, verify every target the whole patch
-        will write to is actually writable. If not, throw a single clear error so the run
-        aborts cleanly with the install untouched — instead of bricking halfway through.
+        PREFLIGHT: before touching ANY content, verify every write target is writable and
+        abort cleanly (install untouched) rather than bricking halfway.
     .NOTES
-        - Runs AFTER Stop-ClaudeServices + Take-Ownership (writability reflects the ACLs the
-          patch grants itself; before stopping services the binaries are falsely "locked").
-        - Uses a BOUNDED WAIT per target (mirrors the per-step Wait-FileUnlock gates) so it is
-          at least as tolerant as the current code — it can never block a machine the current
-          code would succeed on (e.g. cowork-svc briefly releasing after service stop).
-        - Directory checks are WARN-ONLY (never abort).
-        - Fail-safe: runs before any content change, so the worst case is "refuses to run",
-          never a corrupted file.
+        - Runs AFTER Stop-ClaudeServices + Take-Ownership (before that the binaries look
+          falsely "locked").
+        - Bounded wait per target (like Wait-FileUnlock), so it can never block a machine
+          the current code would succeed on.
+        - Directory checks are WARN-ONLY. Runs before any content change, so worst case is
+          "refuses to run", never a corrupted file.
     #>
     param(
         [Parameter(Mandatory)][string[]]$WriteTargets,
@@ -1801,7 +1639,7 @@ function Assert-PatchWritable {
         }
     }
 
-    # Directory writability (new .bak/.new files land here) — WARN ONLY, never aborts.
+    # Directory writability (new .bak/.new files land here) -- WARN ONLY, never aborts.
     foreach ($d in $DirTargets) {
         try {
             if (-not (Test-Path -LiteralPath $d)) { continue }
@@ -1836,12 +1674,11 @@ How to fix:
 function Test-FileValid([string]$Path, [string]$Type) {
     <#
     .SYNOPSIS
-        Validates that a file is structurally well-formed for its declared type.
-        Returns $true if valid, $false otherwise. Never throws on a missing or
-        malformed file — callers decide how to react.
+        Validates a file is structurally well-formed for its type. $true/$false; never
+        throws on a missing/malformed file (callers decide how to react).
     .PARAMETER Type
-        'asar' — verifies a parsable Electron ASAR header (Compute-AsarHash succeeds).
-        'pe'   — verifies a Windows PE binary: 'MZ' signature and size >= 1 MB.
+        'asar' -- parsable Electron ASAR header (Compute-AsarHash succeeds).
+        'pe'   -- Windows PE binary: 'MZ' signature and size >= 1 MB.
     #>
     if (-not (Test-Path $Path)) { return $false }
     try {
@@ -1874,18 +1711,14 @@ function Test-FileValid([string]$Path, [string]$Type) {
 function Copy-FileSafe([string]$Source, [string]$Dest, [string]$ValidateAs) {
     <#
     .SYNOPSIS
-        Atomic file copy with content validation. Writes to "<Dest>.tmp" first,
-        verifies the temp file matches the source byte-for-byte (length + optional
-        type-specific structural check), then renames to <Dest>. If anything fails,
-        the temp is removed and the original <Dest> (if any) is left untouched.
+        Atomic file copy with validation: writes "<Dest>.tmp", verifies it matches the
+        source (length + optional type check), then renames to <Dest>. On any failure the
+        temp is removed and <Dest> is left untouched.
     .PARAMETER ValidateAs
-        Optional. 'asar' or 'pe'. If supplied, Test-FileValid is also called on the
-        temp file before the rename. Pass empty string or omit to skip type check.
+        Optional 'asar' or 'pe'. Test-FileValid runs on the temp before rename; omit to skip.
     .NOTES
-        - Falls back to byte-level read/write if Copy-Item fails (preserves the
-          SCM-locked-binary handling from issue #4).
-        - Source is also validated against ValidateAs before copy: a corrupted
-          source must not become a corrupted backup.
+        - Falls back to byte-level read/write if Copy-Item fails (issue #4 SCM-locked binary).
+        - Source is validated too: a corrupted source must not become a corrupted backup.
     #>
     if (-not (Test-Path -LiteralPath $Source)) {
         throw "Copy-FileSafe: source '$Source' does not exist."
@@ -1925,8 +1758,7 @@ function Copy-FileSafe([string]$Source, [string]$Dest, [string]$ValidateAs) {
         }
     }
 
-    # Verify size matches the source — primary defense against truncated copies
-    # (MSIX bindflt sparse reads, EDR interference, mid-copy interruption).
+    # Verify size matches the source -- primary defense against truncated copies.
     try {
         $srcLen = (Get-Item -LiteralPath $Source -ErrorAction Stop).Length
         $tmpLen = (Get-Item -LiteralPath $tmpDest -ErrorAction Stop).Length
@@ -2007,9 +1839,8 @@ function Start-ClaudeServices {
             Start-Process "shell:AppsFolder\$appId" -ErrorAction Stop
             Write-Success "Claude Desktop launched."
         } else {
-            # The elevated identity may differ from the account Claude is
-            # registered to (#34) -- app activation is per-user, so launching
-            # from here isn't possible in that case.
+            # Elevated identity may differ from Claude's owning account (#34); app
+            # activation is per-user, so launching from here isn't possible then.
             Write-Warn "Claude isn't registered to this (elevated) account -- or isn't installed."
             Write-Log "Please start Claude manually from the Start Menu."
         }
@@ -2028,26 +1859,20 @@ function Take-Ownership($Path) {
 function Remove-CertPrivateKey {
     <#
     .SYNOPSIS
-        Destroys the private key material behind a certificate and VERIFIES it is gone.
-        Handles RSA *and* ECDSA keys, over CNG or (legacy) CSP providers.
-    .DESCRIPTION
-        The self-signed cert the patch generates may use RSA (1024/2048) OR ECDSA P-256
-        (the smaller-hole fallback config). The previous inline wipe only ever called
-        GetRSAPrivateKey -- which returns $null for an ECDSA cert -- so an ECDSA private
-        key was NEVER deleted: it stayed in the machine key store while its public cert
-        remained trusted machine-wide in Root, i.e. a usable code-signing key an admin
-        attacker could reuse. This deletes the key for every config and then re-checks the
-        key container no longer exists, so the caller can fail loudly if it survived.
+        Destroys a certificate's private key and VERIFIES it is gone. Handles RSA *and*
+        ECDSA, over CNG or legacy CSP. Matters because the patch's cert may be ECDSA
+        (smaller-hole fallback), and an RSA-only wipe would leak the ECDSA key while its
+        public cert stays machine-trusted in Root -- a reusable code-signing key.
     .OUTPUTS
-        [bool] $true only when no private key remains (deleted and verified, or there was
-        none to begin with). $false when a key may still exist or removal can't be confirmed.
+        [bool] $true only when no private key remains (verified, or none to begin with);
+        $false when a key may still exist or removal can't be confirmed.
     #>
     param([Parameter(Mandatory)][System.Security.Cryptography.X509Certificates.X509Certificate2]$Cert)
 
     if (-not $Cert.HasPrivateKey) { return $true }
 
-    # Capture the CNG container name BEFORE deletion -- needed for the fallback delete and
-    # for the post-delete existence check. Legacy CSP keys don't expose it this way ($null).
+    # Capture the CNG container name BEFORE deletion (for the fallback delete and the
+    # post-delete existence check). Legacy CSP keys don't expose it this way ($null).
     $container = $null
     try {
         $probe = $null
@@ -2075,8 +1900,8 @@ function Remove-CertPrivateKey {
         Write-Log "Remove-CertPrivateKey: typed delete threw ($($_.Exception.Message)); trying CngKey fallback."
     }
 
-    # Fallback: open the container by name and delete it directly. Covers the case where the
-    # typed path didn't match a known provider type but we still hold the container name.
+    # Fallback: open the container by name and delete it directly (typed path didn't
+    # match a known provider type, but we hold the container name).
     if (-not $deleted -and $container) {
         try {
             $prov = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
@@ -2090,8 +1915,8 @@ function Remove-CertPrivateKey {
         }
     }
 
-    # Verify: if we know the container, it MUST no longer exist. This is what lets the
-    # caller fail loudly instead of trusting a delete call that silently no-op'd.
+    # Verify: if we know the container, it MUST no longer exist -- lets the caller fail
+    # loudly instead of trusting a delete that silently no-op'd.
     if ($container) {
         try {
             $prov = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
@@ -2128,11 +1953,9 @@ function Compute-AsarHash($AsarPath) {
 }
 
 # -----------------------------------------------------------------------------
-# Alternative bypass path used when the byte-level hash replacement can't locate
-# the asar hash inside claude.exe (e.g. hash encoding, algorithm or storage
-# location changed upstream). Decomposed into a probe + a predicate + the main
-# entry so each piece is testable in isolation. We never throw from here — the
-# caller chooses what to do with a $false return.
+# Alternative bypass path when the byte-level hash replacement can't locate the asar
+# hash inside claude.exe (upstream encoding/algorithm/location changed). Split into
+# probe + predicate + entry for testability. Never throws -- caller reacts to $false.
 # -----------------------------------------------------------------------------
 
 # Pattern matched against `@electron/fuses read` output to detect the disabled state.
@@ -2169,7 +1992,7 @@ function Invoke-FuseFlip {
         Write-Log "Probing Electron fuse state on $(Split-Path $ExePath -Leaf)..."
         $before = Get-FuseProbeOutput -ExePath $ExePath
         if (Test-AsarIntegrityFuseDisabled -ProbeOutput $before) {
-            Write-Success "ASAR integrity fuse already off — nothing to do."
+            Write-Success "ASAR integrity fuse already off -- nothing to do."
             return $true
         }
 
@@ -2184,7 +2007,7 @@ function Invoke-FuseFlip {
             return $false
         }
 
-        # Re-probe — some tool builds print "Fuses written" without actually persisting.
+        # Re-probe -- some tool builds print "Fuses written" without persisting.
         $after = Get-FuseProbeOutput -ExePath $ExePath
         if (Test-AsarIntegrityFuseDisabled -ProbeOutput $after) {
             Write-Success "Fuse disabled and confirmed via re-probe."
@@ -2205,16 +2028,13 @@ function Invoke-FuseFlip {
 function Create-UpdateShortcut {
     Write-Step "Creating Quick Update Shortcut..."
     Try {
-        # Ensure the verified-update helper exists locally before pointing the
-        # shortcut at it. Save-UpdateScript is idempotent.
+        # Ensure the verified-update helper exists before pointing at it (idempotent).
         Save-UpdateScript
 
         $WshShell = New-Object -comObject WScript.Shell
         $DesktopPath = [Environment]::GetFolderPath('Desktop')
-        # When elevation switched identity (#34), this resolves to the ADMIN's
-        # desktop -- invisible to the account that actually uses Claude. Fall
-        # back to the Public desktop, which every account sees (writing there
-        # requires admin rights, which this elevated process has).
+        # On identity mismatch (#34) this is the ADMIN's desktop, invisible to the user
+        # of Claude -- fall back to the Public desktop (visible to all, admin-writable).
         $desktopLabel = "your Desktop"
         if ($env:PUBLIC -and (Get-MismatchedConsoleUser)) {
             $publicDesktop = Join-Path $env:PUBLIC 'Desktop'
@@ -2228,9 +2048,8 @@ function Create-UpdateShortcut {
 
         $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
         $Shortcut.TargetPath = "powershell.exe"
-        # Point at the LOCAL verified-update helper, not at remote install.ps1.
-        # The helper uses the pinned pubkey to verify patch.ps1 before elevating;
-        # a hijacked GitHub install.ps1 cannot influence this path.
+        # Point at the LOCAL verified-update helper (verifies patch.ps1 via the pinned
+        # pubkey), not remote install.ps1 which a hijacked repo could influence.
         $Shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$LocalUpdatePath`""
         $Shortcut.Description = "Verified update of the Claude Desktop RTL patch"
 
@@ -2251,12 +2070,10 @@ function Create-UpdateShortcut {
 
 # -----------------------------------------------------------------------------
 # AUTO-UPDATE WATCHER (Scheduled Task)
-# The watcher is written to %ProgramData%\ClaudeRtlPatch\watcher.ps1 and launched
-# via -File (NOT -EncodedCommand). A readable on-disk script avoids the encoded-
-# PowerShell heuristic that Defender flags as Trojan:Win32/Goptaju once the body
-# also downloads + verifies patch.ps1 from GitHub. The watcher only MONITORS for
-# new claude.exe versions; when it fires it fetches patch.ps1 LIVE from GitHub and
-# runs THAT (see Invoke-AutoPatch) -- never a local copy.
+# Written to ProgramData\ClaudeRtlPatch\watcher.ps1 and launched via -File (not
+# -EncodedCommand -- the encoded form trips Defender's Trojan:Win32/Goptaju
+# heuristic once the body downloads patch.ps1). The watcher only MONITORS for new
+# claude.exe versions; when it fires it fetches patch.ps1 LIVE and runs THAT.
 # -----------------------------------------------------------------------------
 function Save-WatcherScript {
     try {
@@ -2269,8 +2086,7 @@ function Save-WatcherScript {
         # Single-quoted here-string: $ signs are preserved literally for runtime evaluation inside the watcher.
         $watcherBody = @'
 $ErrorActionPreference = "Continue"
-# Scheduled Task PowerShell defaults to TLS 1.0, which GitHub rejects. Force 1.2
-# so WebClient calls to raw.githubusercontent.com succeed.
+# Scheduled Task PowerShell defaults to TLS 1.0; GitHub needs 1.2.
 try {
     [Net.ServicePointManager]::SecurityProtocol =
         [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
@@ -2280,13 +2096,10 @@ $stateFile      = Join-Path $stateDir "state.json"
 $logFile        = Join-Path $stateDir "watcher.log"
 $lastActionFile = Join-Path $stateDir "last-action.txt"
 $pubkeyPinFile  = Join-Path $stateDir "trusted-pubkey.b64"
-# Files created in ProgramData by the elevated installer (state.json, the
-# pubkey pin, an admin-created watcher.log) are not writable by standard
-# users, so when this watcher runs as one (#34) appends can be denied. Probe
-# the log for real append access and move ONLY the writable artifacts (log +
-# throttle) to the user's LocalAppData; state.json and the pinned pubkey stay
-# in ProgramData and are only read. Only access-denied triggers the move --
-# transient sharing violations (AV scan) must not relocate an admin watcher's log.
+# ProgramData files written by the elevated installer aren't writable by a standard
+# user, so an unelevated watcher (#34) can't append the log. Probe for append access
+# and, only on access-denied, move the writable artifacts (log + throttle) to the
+# user's LocalAppData; state.json and the pubkey pin stay in ProgramData (read-only).
 try {
     if (-not (Test-Path $stateDir)) { New-Item -ItemType Directory -Path $stateDir -Force | Out-Null }
     $probe = [System.IO.File]::Open($logFile, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
@@ -2299,13 +2112,9 @@ try {
         $lastActionFile = Join-Path $userStateDir "last-action.txt"
     } catch {}
 } catch {}
-# The watcher fetches patch.ps1 + patch.ps1.sig DIRECTLY and verifies them with
-# the locally-pinned pubkey. install.ps1 is intentionally NOT used here: it is
-# unsigned, and any compromised version of install.ps1 served from a hijacked
-# repo would otherwise execute as admin during auto-update. Pinning the full
-# pubkey (not a fingerprint of install.ps1's $ExpectedPubKey variable) means
-# the only thing we trust from the network is patch.ps1 itself, validated
-# byte-for-byte against the maintainer's offline private key.
+# The watcher fetches patch.ps1 + patch.ps1.sig directly and verifies them with the
+# locally-pinned pubkey. The unsigned install.ps1 is never used, so the only trusted
+# network artifact is patch.ps1, validated byte-for-byte against the offline key.
 $repoBase       = "https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main"
 $patchUrl       = "$repoBase/patch.ps1"
 $sigUrl         = "$repoBase/patch.ps1.sig"
@@ -2359,11 +2168,9 @@ function Get-PatchedVer {
 }
 
 function Get-PinnedRsa {
-    # Loads the pinned public key from disk and returns an RSA object configured
-    # with the maintainer's pubkey, plus the original base64 blob (so callers
-    # can forward it via env var to any child process without re-encoding).
-    # The watcher uses this RSA object directly to verify patch.ps1.sig --
-    # install.ps1 is never consulted, never executed during auto-update.
+    # Loads the pinned pubkey and returns an RSA object plus the original base64 blob
+    # (so callers can forward it via env var without re-encoding). Used directly to
+    # verify patch.ps1.sig; install.ps1 is never consulted.
     try {
         if (-not (Test-Path $pubkeyPinFile)) {
             Write-WLog "No pinned pubkey at $pubkeyPinFile -- refusing to auto-update."
@@ -2389,7 +2196,7 @@ function Get-PinnedRsa {
 }
 
 function Invoke-AutoPatch($newVer, $exePath) {
-    # Throttle: skip if we acted within the last 90 seconds (avoids loops on multi-process Electron startup).
+    # Throttle: skip if we acted in the last 90s (avoids loops on Electron startup).
     if (Test-Path $lastActionFile) {
         try {
             $last = [DateTime]::Parse((Get-Content $lastActionFile -Raw))
@@ -2409,10 +2216,9 @@ function Invoke-AutoPatch($newVer, $exePath) {
         return
     }
 
-    # Fetch patch.ps1 + signature directly as raw bytes. The signature is over
-    # the exact LF-normalized bytes the maintainer signed; raw.githubusercontent.com
-    # serves LF (.gitattributes eol=lf), so the on-wire bytes match. Do NOT
-    # decode to string before verifying -- string round-trips can alter BOMs.
+    # Fetch as raw bytes and verify those directly. The signature is over the
+    # LF-normalized bytes the maintainer signed (raw.githubusercontent.com serves LF
+    # via .gitattributes); decoding to string first could alter BOMs.
     try {
         $wc = New-Object System.Net.WebClient
         $patchBytes = $wc.DownloadData($patchUrl)
@@ -2444,33 +2250,28 @@ function Invoke-AutoPatch($newVer, $exePath) {
 
     Write-WLog "Signature verified ($($patchBytes.Length) bytes). Writing temp file and launching patch.ps1..."
 
-    # Write patch.ps1 to disk with a UTF-8 BOM (PS 5.1 needs the BOM to parse
-    # Hebrew/box-drawing characters correctly). Strip any incoming BOM from the
-    # bytes first to avoid double-BOM.
+    # Write with a UTF-8 BOM (PS 5.1 needs it to parse patch.ps1); strip any incoming
+    # BOM first to avoid a double-BOM.
     $tmpFile = Join-Path $env:TEMP 'claude_rtl_patch.ps1'
     $content = [System.Text.Encoding]::UTF8.GetString($patchBytes)
     if ($content.Length -gt 0 -and $content[0] -eq [char]0xFEFF) { $content = $content.Substring(1) }
     [System.IO.File]::WriteAllText($tmpFile, $content, [System.Text.UTF8Encoding]::new($true))
 
-    # An unelevated watcher (registered for a standard user, #34) must NOT kill
-    # Claude before elevation: the re-patch will pause on a UAC prompt, and if
-    # the user can't approve it they'd be stuck in a kill-relaunch-prompt loop.
-    # Elevated watchers keep the original snappy kill-first behavior.
+    # An unelevated watcher (#34) must NOT kill Claude before elevation: the re-patch
+    # pauses on a UAC prompt, which without approval leaves a kill-relaunch loop.
+    # Elevated watchers keep the snappy kill-first behavior.
     $watcherIsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if ($watcherIsAdmin) {
         Show-Toast "Claude updated to v$newVer" "Auto-patching now. A PowerShell window will open with the patch log."
-        # Kill running Claude processes for snappy UX (patch.ps1 will kill again via Stop-ClaudeServices).
         Get-Process -Name claude,cowork-svc -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     } else {
         Show-Toast "Claude updated to v$newVer" "The RTL patch needs re-applying. Please approve the admin (UAC) prompt."
     }
 
     try {
-        # Propagate the pinned pubkey to the child so any re-registration that
-        # happens inside patch.ps1 (Save-TrustedPubkey) sees the SAME trust
-        # anchor -- never downgraded to "whatever's currently in install.ps1
-        # on GitHub". The watcher is already elevated (RunLevel Highest), so
-        # the spawned PowerShell inherits the elevated token without a UAC prompt.
+        # Propagate the pinned pubkey to the child so its Save-TrustedPubkey keeps the
+        # SAME anchor. The watcher is elevated (RunLevel Highest), so the spawned child
+        # inherits the token without a UAC prompt.
         $env:CLAUDE_RTL_TRUSTED_PUBKEY = $pinned.PubB64
         $env:CLAUDE_RTL_AUTO = '1'
         Start-Process -FilePath "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" `
@@ -2502,7 +2303,7 @@ function Test-AndPatch($exePath) {
 Write-WLog "Watcher started (PID $PID, user $env:USERNAME)"
 Write-WLog "Currently patched version: $(Get-PatchedVer)"
 
-# Initial sweep — Claude might already be running from a newer version when the watcher starts.
+# Initial sweep -- Claude may already be running a newer version at watcher start.
 try {
     $existing = Get-Process -Name claude -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1
     if ($existing) { Test-AndPatch $existing.Path }
@@ -2547,18 +2348,15 @@ function Install-AutoUpdateTask {
         return
     }
 
-    # Pin the maintainer's pubkey BEFORE registering the task. The watcher
-    # verifies patch.ps1 against this pinned pubkey -- closes the "full repo
-    # takeover" vector for existing installs.
+    # Pin the pubkey BEFORE registering the task (closes the repo-takeover vector).
     Save-TrustedPubkey
 
     # Write the watcher to disk; the task launches it via -File (not -EncodedCommand).
     Save-WatcherScript
     $watcherPath = Join-Path $global:RtlStateDir 'watcher.ps1'
 
-    # Save-WatcherScript / Save-TrustedPubkey fail closed if the state dir can't
-    # be locked to Administrators (trust-anchor hardening). Never register a
-    # scheduled task that runs a watcher script from an unverified directory.
+    # Save-WatcherScript fails closed if the state dir can't be locked. Never register
+    # a task that runs a watcher script from an unverified directory.
     if (-not (Test-Path $watcherPath)) {
         Write-Warn "Watcher script was not written (state dir could not be secured); skipping task registration."
         Write-Warn "The RTL patch itself is applied; only the automatic re-patch on updates is disabled."
@@ -2567,11 +2365,9 @@ function Install-AutoUpdateTask {
 
     Try {
         $userName  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-        # After UAC elevation with separate admin credentials, GetCurrent() is
-        # the admin -- an account that never logs on interactively, so an
-        # AtLogOn/Interactive task registered to it would never fire (#34).
-        # Register for the console user instead; re-patching then goes through
-        # the verified update helper's UAC prompt at that user's logon.
+        # On identity mismatch (#34) GetCurrent() is the admin, who never logs on
+        # interactively, so an AtLogOn task registered to it never fires. Register for
+        # the console user instead (re-patch goes through the helper's UAC prompt).
         $identityMismatch = $false
         $consoleUser = Get-MismatchedConsoleUser
         if ($consoleUser) {
@@ -2651,13 +2447,10 @@ function Install-Patch {
         $cmdOut = cmd.exe /c "npx --yes $($script:AsarPackage) --version 2>&1"
         if ($LASTEXITCODE -ne 0) { throw "ASAR missing" }
     } Catch {
-        # The npx probe failed -- two distinct causes with different fixes:
-        #  1) npx unreachable: a Node version manager shim (e.g. Volta) on PATH
-        #     fails under the elevated PATH (rebuilt from the registry across
-        #     UAC). Retry with system Node at %ProgramFiles%\nodejs if present.
-        #  2) Node present but older than $script:MinNodeVersion -- the pinned
-        #     @electron/asar/fuses refuse to run. Surface the version and tell
-        #     the user to upgrade rather than printing "install Node" (issue #11).
+        # npx probe failed -- two causes: (1) npx unreachable (e.g. a Volta shim broken
+        # under the elevated PATH) -- retry with system Node at ProgramFiles\nodejs;
+        # (2) Node older than MinNodeVersion, so the pinned packages refuse to run --
+        # surface the version and tell the user to upgrade, not "install Node" (#11).
         $sysNodeDir = Join-Path $env:ProgramFiles 'nodejs'
         $ok = $false
         if ((Test-Path (Join-Path $sysNodeDir 'node.exe')) -and `
@@ -2701,10 +2494,8 @@ function Install-Patch {
     Take-Ownership $AppDir
     Take-Ownership $ResourcesDir
 
-    # PREFLIGHT: verify EVERY file the whole patch will write is writable, before we touch
-    # any content. Aborts cleanly (install untouched) instead of bricking halfway. Runs here
-    # because writability depends on the ownership just granted and on the services being
-    # stopped above. See Assert-PatchWritable for the fail-safe / bounded-wait guarantees.
+    # PREFLIGHT: verify every write target is writable before touching content (must run
+    # after the ownership grant + service stop above). Aborts cleanly, install untouched.
     Assert-PatchWritable -WriteTargets @($AsarPath, $ExePath, $CoworkSvcPath) `
                          -DirTargets @($ResourcesDir, $AppDir) -TimeoutSeconds 15
 
@@ -2720,22 +2511,18 @@ function Install-Patch {
     if (-not (Test-Path "$ExePath.bak") -and (Test-Path $ExePath))             { Copy-FileSafe $ExePath        "$ExePath.bak"        'pe';   Write-Success "claude.exe.bak created" }
     if (-not (Test-Path "$CoworkSvcPath.bak") -and (Test-Path $CoworkSvcPath)) { Copy-FileSafe $CoworkSvcPath  "$CoworkSvcPath.bak"  'pe';   Write-Success "cowork-svc.exe.bak created" }
 
-    # Always restore from backup before patching — ensures clean state
-    # First run: .bak was just created from same file → copy is a no-op (safe)
-    # Re-run: restores original files → fresh install on clean files
-    # CRITICAL: validate every backup BEFORE overwriting the live files. If a backup
-    # is corrupt (e.g., truncated leftover from older buggy versions), restoring it
-    # would brick the install — and the rollback path can't recover because it
-    # also reads from .bak.
+    # Always restore from backup before patching, so a re-run starts from clean files
+    # (first run: .bak equals the live file, so the copy is a no-op). CRITICAL: validate
+    # every backup BEFORE overwriting live files -- restoring a corrupt .bak would brick
+    # the install, and the rollback path also reads from .bak.
     Write-Step "Ensuring clean state before patching..."
     $RestorePairs = @(
         @{O=$AsarPath;       B="$AsarPath.bak";       T='asar'},
         @{O=$ExePath;        B="$ExePath.bak";        T='pe'},
         @{O=$CoworkSvcPath;  B="$CoworkSvcPath.bak";  T='pe'}
     )
-    # Pre-flight: verify ALL existing backups are valid before touching anything.
-    # An all-or-nothing check prevents a partial restore that could leave
-    # claude.exe's embedded asar hash mismatching app.asar.
+    # Verify ALL existing backups are valid first (all-or-nothing), so a partial restore
+    # can't leave claude.exe's embedded asar hash mismatching app.asar.
     foreach ($pair in $RestorePairs) {
         if ((Test-Path $pair.B) -and -not (Test-FileValid -Path $pair.B -Type $pair.T)) {
             $bakName = Split-Path $pair.B -Leaf
@@ -2766,10 +2553,8 @@ function Install-Patch {
 
         $BuildDir = Join-Path $global:TmpDir ".vite\build"
         if (Test-Path $BuildDir) {
-            # Resolve the Electron main-process entry from package.json "main"
-            # (currently ".vite/build/index.pre.js"); fall back to the known filename if
-            # parsing fails. The ENTRY alone receives the tiny main-process switch
-            # injection ($MAIN_INJECTION_CODE), NOT the renderer RTL/DOM payload.
+            # Resolve the main-process entry from package.json "main" (fallback to the
+            # known filename). The ENTRY alone gets $MAIN_INJECTION_CODE, NOT the renderer payload.
             $MainEntryFile = 'index.pre.js'
             $PkgJsonPath = Join-Path $global:TmpDir 'package.json'
             if (Test-Path $PkgJsonPath) {
@@ -2780,13 +2565,9 @@ function Install-Patch {
             }
             Write-Log "Main-process entry: $MainEntryFile"
 
-            # Files that run OUTSIDE the renderer and must NOT receive the renderer-only
-            # RTL/DOM payload (no DOM; injecting risks breaking MCP startup -- issue #14).
-            # index.js is the large main bundle the entry require()s; the rest are Node
-            # MCP host/workers. All skipped entirely. The main ENTRY is handled separately
-            # below: it gets $MAIN_INJECTION_CODE (force-ui-direction=ltr), which runs
-            # before app 'ready' and fixes the native preview window jumping left and the
-            # title-bar control placement on RTL OS locales.
+            # Non-renderer files that must NOT receive the renderer payload (no DOM;
+            # injecting risks breaking MCP startup -- #14). index.js is the large main
+            # bundle; the rest are Node MCP hosts/workers. All skipped entirely.
             $SkipEntirely = @(
                 'index.js',                 # .vite/build/index.js         - large main-process bundle
                 'directMcpHost.js',         # .vite/build/mcp-runtime/...  - Node MCP host
@@ -2798,8 +2579,8 @@ function Install-Patch {
             $Injected = 0
             $MainInjected = 0
             $utf8NoBom = New-Object System.Text.UTF8Encoding $false
-            # A leading "use strict"; must stay the FIRST statement of every file
-            # the patch prepends to. Both injection branches below insert AFTER it.
+            # A leading "use strict"; must stay the FIRST statement; both branches below
+            # insert AFTER it (a bare prepend would demote it to sloppy mode -- #36).
             $strictRe = '^\s*("use strict"|''use strict'')\s*;'
             foreach ($file in $JsFiles) {
                 if ($SkipEntirely -contains $file.Name) {
@@ -2809,11 +2590,8 @@ function Install-Patch {
                 $content = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
 
                 if ($file.Name -eq $MainEntryFile) {
-                    # Main-process entry: inject the Chromium UI-direction switch only.
-                    # Insert AFTER the leading "use strict"; directive so the bundle keeps
-                    # strict mode -- a bare prepend would demote the directive (it must be
-                    # the first statement) and silently disable strict mode for the whole
-                    # main bundle.
+                    # Main-process entry: inject the Chromium UI-direction switch only,
+                    # after "use strict"; (see $strictRe note).
                     if ($content -match "CLAUDE RTL MAIN PATCH START") { continue }
                     if ($content -match $strictRe) {
                         $prologue = $matches[0]
@@ -2823,10 +2601,8 @@ function Install-Patch {
                     }
                     [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
 
-                    # Fail fast: a syntax error in the ENTRY would prevent Claude from
-                    # starting at all, and the snippet's try/catch cannot guard a parse
-                    # error. Validate the written file before committing to a repack
-                    # (Test-FileValid checks asar structure, not JS syntax).
+                    # Fail fast: a syntax error in the ENTRY prevents Claude from starting
+                    # and try/catch can't guard a parse error, so validate before repack.
                     cmd.exe /c "node --check `"$($file.FullName)`""
                     if ($LASTEXITCODE -ne 0) {
                         throw "node --check failed on patched main entry '$($file.Name)'. Refusing to repack -- the injected main-process snippet would prevent Claude from starting."
@@ -2836,13 +2612,9 @@ function Install-Patch {
                     continue
                 }
 
-                # Renderer file: inject the RTL/DOM payload. Insert AFTER a leading
-                # "use strict"; -- a bare prepend demotes the directive (it must be
-                # the first statement) and silently switches the whole chunk to
-                # sloppy mode. Sloppy mode flips detached-call `this` from undefined
-                # to globalThis, which broke winston's `const u = this || a` logger
-                # fallback in the session-start chunks on 1.22209.0.0 (issue #36:
-                # "u._addDefaultMeta is not a function" on Claude Code/Cowork start).
+                # Renderer file: inject the RTL/DOM payload after "use strict"; -- a bare
+                # prepend demotes the directive to sloppy mode, which flips detached-call
+                # `this` to globalThis and broke winston's logger fallback (issue #36).
                 if ($content -match "CLAUDE RTL PATCH START") { continue }
                 if ($content -match $strictRe) {
                     $prologue = $matches[0]
@@ -2868,11 +2640,9 @@ function Install-Patch {
             throw "asar pack failed with exit code $LASTEXITCODE."
         }
         if (-not (Test-FileValid -Path $TmpAsarPath -Type 'asar')) {
-            # Test-FileValid swallows the real exception and returns $false, leaving the
-            # reporter with a generic message. Surface WHY the repacked archive is
-            # unreadable so the failure is diagnosable from patch.log (issue #26).
-            # Each probe is independently guarded so the diagnostics themselves can't
-            # mask the original failure. Gather everything BEFORE deleting the temp.
+            # Test-FileValid returns a bare $false, so surface WHY the repacked archive
+            # is unreadable for patch.log (#26). Each probe is guarded; gather all before
+            # deleting the temp.
             Write-Log "Repacked ASAR validation FAILED -- gathering diagnostics:"
             try {
                 $diagLen = (Get-Item -LiteralPath $TmpAsarPath -ErrorAction Stop).Length
@@ -2902,10 +2672,8 @@ function Install-Patch {
 
         $NewHash = Compute-AsarHash $TmpAsarPath
         Write-Log "New Hash: $NewHash"
-        # Move-Item -Force does not reliably overwrite an existing destination on
-        # Windows PowerShell (issue #33: "Cannot create a file when that file
-        # already exists"). Delete the target first. Safe: app.asar.bak was
-        # validated above and any throw here rolls back from it.
+        # Move-Item -Force doesn't reliably overwrite on Windows PowerShell (#33), so
+        # delete the target first. Safe: app.asar.bak was validated and rolls back on throw.
         if (Test-Path -LiteralPath $AsarPath) { Remove-Item -LiteralPath $AsarPath -Force -ErrorAction Stop }
         Move-Item -LiteralPath $TmpAsarPath -Destination $AsarPath -Force
 
@@ -2948,12 +2716,9 @@ function Install-Patch {
 
             Write-Log "Target cowork-svc hole found at $([Convert]::ToString($StartPos, 16)) (Size: $OldCertSize bytes)."
 
-            # Log the original cert Subject for diagnostics, but DON'T clone it into the
-            # replacement: the Anthropic subject carries SERIALNUMBER + jurisdiction OID
-            # fields that alone push the DER cert to ~1136 bytes. We pin a compact subject
-            # instead so subject length can never blow the binary hole. The subject is
-            # cosmetic anyway -- trust comes from the Root-store entry added below, not the
-            # subject text.
+            # Log the original subject but DON'T clone it: its SERIALNUMBER + jurisdiction
+            # OID fields bloat the DER cert (~1136 bytes) past the hole. Pin a compact
+            # subject instead (cosmetic -- trust comes from the Root-store entry below).
             $OriginalSig = Get-AuthenticodeSignature -FilePath $SourceExe
             if ($OriginalSig -and $OriginalSig.SignerCertificate) {
                 Write-Log "Original certificate subject (for reference): $($OriginalSig.SignerCertificate.Subject)"
@@ -2961,18 +2726,11 @@ function Install-Patch {
             $CertSubject = "CN=Anthropic PBC, O=Anthropic PBC, L=San Francisco, S=California, C=US"
             Write-Log "Using compact subject for binary fit: $CertSubject"
 
-            # The replacement cert must fit the fixed-size hole left by the original
-            # Anthropic cert (size detected per-binary above -- e.g. 856 bytes on some
-            # 1.12603.x builds, ~1457 bytes on others). Cert size is deterministic, driven
-            # almost entirely by the key algorithm/length -- an RSA-2048 code-signing cert
-            # is ~936 bytes EVERY time, so the old "regenerate the same RSA-2048 key 10x"
-            # loop could never shrink below an 856-byte hole (only serial/dates varied).
-            # Instead, walk a list of progressively smaller key configs and take the first
-            # that fits. RSA-1024 (~675 bytes) is preferred for maximum Authenticode
-            # compatibility; ECDSA P-256 (~540 bytes) is a smaller fallback; RSA-2048
-            # (~936 bytes) only fits a large hole but is kept last. (ECDSA_P256 is the
-            # documented New-SelfSignedCertificate algorithm name -- portable across
-            # Windows versions.) A weak key is acceptable here: trust derives from the
+            # The replacement cert must fit the fixed hole (size detected per-binary
+            # above). Cert size is driven by the key algorithm/length, so walk from
+            # smallest key config up and take the first that fits: RSA-1024 (~675 bytes,
+            # best Authenticode compatibility), then ECDSA P-256 (~540), then RSA-2048
+            # (~936, large holes only). A weak key is fine here -- trust comes from the
             # Root-store entry, not key strength.
             $CertConfigs = @(
                 @{ Label = "RSA 1024";    KeyParams = @{ KeyAlgorithm = "RSA"; KeyLength = 1024 } },
@@ -3019,10 +2777,8 @@ function Install-Patch {
             $OldHashBytes = [System.Text.Encoding]::ASCII.GetBytes($OldHash)
             $NewHashBytes = [System.Text.Encoding]::ASCII.GetBytes($NewHash)
 
-            # Report a live percentage as the scan sweeps the binary. Write-Progress
-            # draws the bar; a throttled inline print keeps a visible trace in hosts
-            # (and log-capture pipes) where Write-Progress isn't rendered. The inline
-            # print is throttled to 10% steps via a global so it stays readable.
+            # Report live scan progress. Write-Progress draws the bar; the inline print
+            # (throttled to 10% steps) keeps a trace in hosts where the bar isn't rendered.
             $global:RtlScanLastPct = -1
             $global:RtlScanMB      = $ScanMB
             $ScanProgress = {
@@ -3049,10 +2805,9 @@ function Install-Patch {
                 [System.IO.File]::WriteAllBytes($ExePath, $ExeBytes)
                 Write-Success "Replaced $Replacements ASAR hash(es) in claude.exe"
             } else {
-                # Byte search came up empty — the hash format upstream may have
-                # shifted. Fall through to the fuse-based bypass; the subsequent
-                # re-sign block restores a valid Authenticode signature either way.
-                Write-Warn "Old hash not found in claude.exe — falling back to fuse-based bypass."
+                # Byte search empty -- the upstream hash format may have shifted. Fall
+                # through to the fuse bypass; the re-sign block runs either way.
+                Write-Warn "Old hash not found in claude.exe -- falling back to fuse-based bypass."
                 if (-not (Invoke-FuseFlip -ExePath $ExePath)) {
                     throw "Both byte-search and fuse-based bypass failed. Aborting before re-sign."
                 }
@@ -3080,14 +2835,10 @@ function Install-Patch {
             if ($SignResult2.Status -eq 'Valid') { Write-Success "Successfully re-signed cowork-svc.exe" }
             else { throw "Re-signing cowork-svc.exe failed: $($SignResult2.Status)" }
 
-            # 7. WIPE PRIVATE KEY: public cert stays in Root for verification, but the
-            # private key is no longer needed and would let an admin-level attacker
-            # sign additional binaries that Windows would auto-trust.
-            #
-            # Note: 'Remove-Item -DeleteKey' is a dynamic parameter of the Cert:
-            # provider that doesn't always bind through a pipeline in PS 5.1, so
-            # we delete the CSP/CNG key material via .NET, then remove the cert
-            # via X509Store — this works on PS 5.1 and PS 7+ uniformly.
+            # WIPE PRIVATE KEY: the public cert stays in Root for verification, but the
+            # private key would let an admin attacker sign auto-trusted binaries. Delete
+            # the key material via .NET, then remove the cert via X509Store (the Cert:
+            # provider's -DeleteKey doesn't bind reliably in PS 5.1).
             $myStore = $null
             $keyDestroyed = $false
             Try {
@@ -3096,9 +2847,8 @@ function Install-Patch {
                 $myStore.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
                 $found = $myStore.Certificates | Where-Object { $_.Thumbprint -eq $thumb }
                 if ($found) {
-                    # Destroy the private key for RTL's cert regardless of algorithm. The old
-                    # code only handled RSA; an ECDSA fallback cert leaked its key because
-                    # GetRSAPrivateKey returns $null for it. Remove-CertPrivateKey verifies.
+                    # Destroy the key regardless of algorithm (Remove-CertPrivateKey
+                    # handles RSA and ECDSA, and verifies).
                     $keyDestroyed = Remove-CertPrivateKey -Cert $found
                     $myStore.Remove($found)
                     if ($keyDestroyed) {
@@ -3114,10 +2864,9 @@ function Install-Patch {
             }
 
             if (-not $keyDestroyed) {
-                # BACKSTOP (rare): the private key could not be verifiably destroyed, so a
-                # usable code-signing key may persist alongside the machine-trusted Root
-                # cert. Do NOT report success -- surface it loudly with recovery steps. The
-                # RTL patch itself is applied and keeps working (per chosen policy).
+                # BACKSTOP (rare): the key couldn't be verifiably destroyed, so a usable
+                # signing key may persist alongside the trusted Root cert. Surface it loudly
+                # (the RTL patch itself still works).
                 Write-Warn "Signing private key could NOT be verified as deleted -- see the red banner below."
                 Write-Host ""
                 Write-Host "================================================================" -ForegroundColor Red
@@ -3144,21 +2893,16 @@ function Install-Patch {
         if (Test-Path $global:TmpDir) { Remove-Item $global:TmpDir -Recurse -Force }
         Save-PatchState -InstallPath $ClaudeDir
 
-        # Pin the maintainer's pubkey on EVERY install, not only when the watcher
-        # is enabled. The local update.ps1 (desktop shortcut) reads the same pin,
-        # so if a user installs + creates a shortcut but declines auto-update,
-        # the shortcut would otherwise fail with "no pinned pubkey".
+        # Pin on EVERY install (not just with the watcher): the desktop shortcut's
+        # update.ps1 reads the same pin and would otherwise fail with "no pinned pubkey".
         Save-TrustedPubkey
 
-        # Always write the local verified-update helper so the desktop shortcut
-        # (current or future) can use it. If the shortcut already exists from
-        # an older install pointing at "irm install.ps1 | iex", refresh it to
-        # point at the local helper -- closes the manual-update bypass for
-        # existing users without requiring them to recreate the shortcut.
+        # Always write the local verified-update helper, and refresh any existing
+        # shortcut that still points at "irm install.ps1 | iex" to use it instead.
         Save-UpdateScript
         try {
-            # Check both spots Create-UpdateShortcut may have used: the current
-            # (elevated) desktop and the Public desktop (identity mismatch, #34).
+            # Check both spots Create-UpdateShortcut uses: the current desktop and the
+            # Public desktop (identity mismatch, #34).
             $shortcutName = "Update Claude RTL.lnk"
             $shortcutSpots = @( (Join-Path ([Environment]::GetFolderPath('Desktop')) $shortcutName) )
             if ($env:PUBLIC) {
@@ -3177,13 +2921,9 @@ function Install-Patch {
         Write-Host " PATCH INSTALLATION COMPLETED SUCCESSFULLY! ENJOY!" -ForegroundColor Green
         Write-Host "=======================================================`n" -ForegroundColor Green
 
-        # Loud warning if the trust anchor failed to land. Save-TrustedPubkey
-        # depends on the CLAUDE_RTL_TRUSTED_PUBKEY env var propagating through
-        # the UAC elevation -- this usually works, but a hostile EDR / AV that
-        # intercepts the elevation could strip the environment block. In that
-        # case the auto-update watcher and the desktop shortcut would both
-        # silently refuse to run later. Surface the failure NOW so the user
-        # can re-run rather than discovering it the next time Claude updates.
+        # Loud warning if the trust anchor didn't land: Save-TrustedPubkey needs the
+        # CLAUDE_RTL_TRUSTED_PUBKEY env var to survive UAC, which a hostile EDR could
+        # strip. Surface it NOW rather than at the next Claude update.
         $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
         if (-not (Test-Path $pinPath)) {
             Write-Host ""
@@ -3212,13 +2952,9 @@ function Install-Patch {
                 try { Install-AutoUpdateTask } catch { Write-Warn "Failed to install auto-patch task: $($_.Exception.Message)" }
             }
         } else {
-            # Auto-mode upgrade path: re-register the watcher whenever the
-            # installed task predates the current on-disk format. This catches:
-            #   - V0/V1/V2 watchers embedded as -EncodedCommand (the encoded
-            #     blob that Defender flags as Trojan:Win32/Goptaju), and
-            #   - any install missing the V2 pubkey pin (trusted-pubkey.b64).
-            # Re-registering rewrites the task to launch watcher.ps1 via -File
-            # and refreshes the pinned pubkey for local signature verification.
+            # Auto-mode upgrade: re-register the watcher when the installed task predates
+            # the on-disk format -- catches legacy -EncodedCommand watchers (Defender's
+            # Goptaju flag) and installs missing the pubkey pin.
             try {
                 $existingTask = Get-ScheduledTask -TaskName $global:RtlTaskName -ErrorAction SilentlyContinue
                 $pinPath = Join-Path $global:RtlStateDir 'trusted-pubkey.b64'
@@ -3246,9 +2982,8 @@ function Install-Patch {
         
         Restore-Patch -IsRollback
 
-        # Don't claim a successful restore here — Restore-Patch may have aborted
-        # (e.g., if all backups were corrupt). The rollback path prints its own
-        # final status line, so we just surface the install failure itself.
+        # Don't claim a successful restore -- Restore-Patch may have aborted and prints
+        # its own final status. Just surface the install failure.
         throw "Installation failed. See rollback status above."
     }
 }
@@ -3289,10 +3024,8 @@ function Restore-Patch {
         @{"Orig" = Join-Path $ResourcesDir "cowork-svc.exe"; "Bak" = Join-Path $ResourcesDir "cowork-svc.exe.bak"; "Type" = 'pe'}
     )
 
-    # Pre-flight: validate every backup we plan to use. A partial restore where
-    # one file is restored from a good .bak but another fails on a corrupt .bak
-    # would leave claude.exe's embedded asar hash mismatching app.asar — worse
-    # than the patched-but-working state we started from.
+    # Validate every backup first: a partial restore (one good .bak, one corrupt) would
+    # leave claude.exe's embedded asar hash mismatching app.asar -- worse than now.
     $InvalidBaks = @()
     foreach ($Item in $FilesToRestore) {
         if (Test-Path -LiteralPath $Item["Bak"]) {
@@ -3339,8 +3072,7 @@ function Restore-Patch {
             }
         }
 
-        # Clean up the pre-rollback snapshots — the restore worked (we're past the
-        # copies above without throwing), so we no longer need the safety copies.
+        # Restore worked (past the copies without throwing) -- drop the safety snapshots.
         foreach ($snap in $SnapshotPaths) {
             if (Test-Path -LiteralPath $snap) {
                 Remove-Item -LiteralPath $snap -Force -ErrorAction SilentlyContinue
@@ -3350,9 +3082,8 @@ function Restore-Patch {
 
     Write-Log "Cleaning up custom certificates..."
     Try {
-        # Delete the private key material FIRST (RSA and ECDSA, including orphaned key
-        # containers left by older ECDSA installs that never wiped the key), THEN remove
-        # the certs. Remove-Item on the Cert: provider deletes the cert but NOT the key.
+        # Delete the private key material FIRST (RSA and ECDSA), THEN the certs --
+        # Remove-Item on the Cert: provider drops the cert but NOT the key.
         Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.FriendlyName -eq 'Claude_RTL_SelfSigned' } | ForEach-Object {
             $null = Remove-CertPrivateKey -Cert $_
             Remove-Item $_.PSPath -ErrorAction SilentlyContinue
@@ -3363,10 +3094,8 @@ function Restore-Patch {
         Write-Warn "Failed to remove some certificates."
     }
 
-    # A user-initiated restore should leave nothing behind that could re-apply the
-    # patch. Remove the auto-update watcher scheduled task so a broken patch can't
-    # silently re-install on the next logon (issue #14 side note). Skip this on the
-    # in-patch rollback path, which must not tear down the watcher mid-patch.
+    # A user-initiated restore removes the watcher task so a broken patch can't silently
+    # re-install on next logon (#14). Skip on the in-patch rollback path.
     if (-not $IsRollback) {
         Uninstall-AutoUpdateTask
     }
