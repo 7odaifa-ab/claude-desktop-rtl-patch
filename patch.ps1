@@ -1096,6 +1096,58 @@ function Find-Bytes([byte[]]$Haystack, [byte[]]$Needle, [int]$StartIndex = 0) {
     return $hayStr.IndexOf($needleStr, $StartIndex, [System.StringComparison]::Ordinal)
 }
 
+# Single-pass, chunked equivalent of "loop Find-Bytes until -1" that finds EVERY
+# occurrence of $Needle and reports percentage progress as it sweeps the haystack.
+# Two reasons this exists instead of looping Find-Bytes:
+#   1. Progress. Find-Bytes delegates to a single native String.IndexOf over the
+#      whole array -- an atomic call with no way to surface a percentage. Chunking
+#      lets us emit a "% scanned" tick between chunks.
+#   2. Speed. Find-Bytes converts the ENTIRE array to a string on every call and
+#      ignores $StartIndex, so looping it to find N matches did N+1 full 222 MB
+#      conversions -- the dominant silent stall during patching. Here each byte is
+#      converted once.
+# Chunks overlap by ($Needle.Length - 1) so a needle straddling a boundary is still
+# found; the "accept only if the match starts inside the primary region" rule below
+# keeps a boundary-straddling match from being counted twice.
+function Find-AllBytesWithProgress {
+    param(
+        [byte[]]$Haystack,
+        [byte[]]$Needle,
+        [scriptblock]$OnProgress,
+        [int]$ChunkSize = 16777216   # 16 MB
+    )
+    $indices = New-Object System.Collections.Generic.List[int]
+    if ($null -eq $Needle -or $Needle.Length -eq 0 -or $null -eq $Haystack -or $Haystack.Length -lt $Needle.Length) {
+        return $indices
+    }
+    $enc       = [System.Text.Encoding]::GetEncoding(28591)  # ISO-8859-1, byte-preserving
+    $needleStr = $enc.GetString($Needle)
+    $overlap   = $Needle.Length - 1
+    $total     = $Haystack.Length
+    $pos       = 0
+    while ($pos -lt $total) {
+        $len     = [Math]::Min($ChunkSize + $overlap, $total - $pos)
+        $chunk   = $enc.GetString($Haystack, $pos, $len)
+        $from    = 0
+        while ($true) {
+            $rel = $chunk.IndexOf($needleStr, $from, [System.StringComparison]::Ordinal)
+            if ($rel -eq -1) { break }
+            # Accept only matches whose start lies in this chunk's primary region
+            # [0, ChunkSize); a match starting in the trailing overlap belongs to the
+            # next chunk's primary region and is counted there -- never twice.
+            if ($rel -ge $ChunkSize) { break }
+            $indices.Add($pos + $rel)
+            $from = $rel + $Needle.Length
+        }
+        $pos += $ChunkSize
+        if ($OnProgress) {
+            $pct = [Math]::Min(100, [int](100.0 * $pos / $total))
+            & $OnProgress $pct
+        }
+    }
+    return $indices
+}
+
 # -----------------------------------------------------------------------------
 # AUTO-UPDATE STATE: shared with the watcher Scheduled Task
 # -----------------------------------------------------------------------------
@@ -2962,19 +3014,33 @@ function Install-Patch {
             Wait-FileUnlock $ExePath
             Write-Log "Reading claude.exe into memory..."
             $ExeBytes = [System.IO.File]::ReadAllBytes($SourceExe)
-            Write-Log "Scanning $([math]::Round($ExeBytes.Length/1MB,1)) MB of claude.exe for ASAR hash matches..."
+            $ScanMB = [math]::Round($ExeBytes.Length/1MB,1)
+            Write-Log "Scanning $ScanMB MB of claude.exe for ASAR hash matches..."
             $OldHashBytes = [System.Text.Encoding]::ASCII.GetBytes($OldHash)
             $NewHashBytes = [System.Text.Encoding]::ASCII.GetBytes($NewHash)
 
-            $OffsetExe = 0
+            # Report a live percentage as the scan sweeps the binary. Write-Progress
+            # draws the bar; a throttled inline print keeps a visible trace in hosts
+            # (and log-capture pipes) where Write-Progress isn't rendered. The inline
+            # print is throttled to 10% steps via a global so it stays readable.
+            $global:RtlScanLastPct = -1
+            $global:RtlScanMB      = $ScanMB
+            $ScanProgress = {
+                param($Pct)
+                Write-Progress -Activity "Scanning claude.exe for ASAR hash matches" `
+                               -Status "$Pct% of $($global:RtlScanMB) MB" -PercentComplete $Pct
+                if ($Pct -ge $global:RtlScanLastPct + 10 -or $Pct -eq 100) {
+                    Write-Host "  [*] Scanned $Pct%..." -ForegroundColor DarkCyan
+                    $global:RtlScanLastPct = $Pct
+                }
+            }
+
+            $MatchIndices = Find-AllBytesWithProgress -Haystack $ExeBytes -Needle $OldHashBytes -OnProgress $ScanProgress
+            Write-Progress -Activity "Scanning claude.exe for ASAR hash matches" -Completed
+
             $Replacements = 0
-
-            while ($true) {
-                $Idx = Find-Bytes -Haystack $ExeBytes -Needle $OldHashBytes -StartIndex $OffsetExe
-                if ($Idx -eq -1) { break }
-
+            foreach ($Idx in $MatchIndices) {
                 [Array]::Copy($NewHashBytes, 0, $ExeBytes, $Idx, $NewHashBytes.Length)
-                $OffsetExe = $Idx + $OldHashBytes.Length
                 $Replacements++
             }
 
