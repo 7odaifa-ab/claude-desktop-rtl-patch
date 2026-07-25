@@ -81,7 +81,38 @@ When you run the script, you get an interactive menu:
 | **3** | Create 'Quick Update' Shortcut | Adds a desktop shortcut for one-click re-patching |
 | **4** | Enable Auto Re-Patch | Installs a background watcher that re-patches after each Claude update |
 | **5** | Disable Auto Re-Patch | Removes that background watcher |
-| **6** | Exit | Close the patcher |
+| **6** | Set Persian/Arabic Font | Routes Persian/Arabic text to an installed font of your choice (e.g. Vazirmatn) |
+| **7** | Exit | Close the patcher |
+
+---
+
+## 🔤 Optional: Persian/Arabic font
+
+Windows renders Persian and Arabic correctly out of the box, but many readers prefer a typeface designed for long-form Arabic-script text (e.g. [Vazirmatn](https://github.com/rastikerdar/vazirmatn)). The patch can route Arabic-script glyphs — and only them — to a font that is **already installed on your machine**.
+
+### How to enable it, step by step
+
+1. **Install the font** (one time, no admin needed). For Vazirmatn:
+   - Download the latest `vazirmatn-vXX.XXX.zip` from the [official releases page](https://github.com/rastikerdar/vazirmatn/releases) and extract it.
+   - Open the extracted `fonts/ttf` folder, select **all** the `.ttf` files, right-click → **Install**.
+2. **Run the patcher** (see [Quick install](#-quick-install) above) and choose **6. Set Persian/Arabic Font** from the menu.
+3. Type the font's family name — for Vazirmatn simply: `Vazirmatn` — and press Enter. The patcher warns you if the font doesn't look installed.
+4. Answer **Y** when asked *"Apply the patch now?"* (this closes Claude Desktop and re-applies the patch with the font enabled).
+5. Open Claude Desktop again. Persian/Arabic text now renders in the chosen font; everything else is unchanged.
+
+**For scripting/automation**, the same setting is available as a parameter:
+
+```powershell
+.\patch.ps1 -ArabicScriptFont "Vazirmatn"
+```
+
+### Good to know
+
+- The patch never bundles or downloads fonts — it only references an installed one via CSS `local()`. If the font isn't installed, nothing changes.
+- **Scoped by `unicode-range`:** Latin, Hebrew, code blocks and math are untouched. Monospace/code stacks are never overridden, even for Arabic characters inside code.
+- **Persistent:** the choice is saved (in `ProgramData\ClaudeRtlPatch`) and survives auto re-patches after Claude updates — set it once and forget it.
+- **Disable:** menu option 6 → type `none` (or `.\patch.ps1 -ArabicScriptFont none`), then re-apply the patch.
+- Any family name of letters/digits/spaces/hyphens works, e.g. `"Noto Naskh Arabic"`.
 
 ---
 

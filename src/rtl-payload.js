@@ -29,6 +29,12 @@
         // work (math islands) waits for quiet.
         var STREAM_HOST_SEL = '[data-alluvium]';
 
+        // Optional Arabic-script font (issue #39). patch.ps1 splices a sanitized,
+        // locally-installed family name over the placeholder at patch time ('' = off);
+        // the guard keeps an unreplaced placeholder from being used as a font name.
+        var ARABIC_FONT = '__RTL_ARABIC_FONT__';
+        if (ARABIC_FONT.indexOf('__') === 0) ARABIC_FONT = '';
+
         function isNativeDir(el) {
             return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
         }
@@ -433,8 +439,86 @@
             document.head.appendChild(s);
         }
 
+        // Route Arabic-range glyphs to ARABIC_FONT without touching any other script.
+        // @font-face + local() + unicode-range defines a scoped family that only covers
+        // Arabic code points and silently no-ops when the font isn't installed. To win
+        // over claude.ai's own stacks WITHOUT overriding its font variables (fragile;
+        // the reason PR #19's approach was rejected), every same-origin font-family
+        // declaration is re-declared verbatim in a shadow stylesheet with the scoped
+        // family prepended -- appended last so source order settles the tie. Idempotent;
+        // re-run as the SPA's split CSS chunks arrive.
+        function injectArabicFont() {
+            if (!ARABIC_FONT || !document.head || !document.body) return;
+            var FAM = 'claude-rtl-arabic';
+            var RANGE = 'U+0600-06FF,U+0750-077F,U+08A0-08FF,U+FB50-FDFF,U+FE70-FEFF';
+            var css = [];
+
+            // Weight-specific faces via full + PostScript names (the static-TTF naming
+            // convention Vazirmatn and most families follow). A missing name just makes
+            // local() fail and the browser synthesize from the closest weight.
+            [['', 'Regular', '400'], [' Medium', 'Medium', '500'],
+             [' SemiBold', 'SemiBold', '600'], [' Bold', 'Bold', '700']].forEach(function(w) {
+                css.push('@font-face{font-family:"' + FAM + '";src:local("' + ARABIC_FONT + w[0] +
+                    '"),local("' + ARABIC_FONT + '-' + w[1] + '");font-weight:' + w[2] +
+                    ';unicode-range:' + RANGE + '}');
+            });
+
+            // Baseline for text that gets its stack purely by inheritance from <body>.
+            // Strip our own family before re-reading, or re-runs would stack it up.
+            var base = '';
+            try { base = getComputedStyle(document.body).fontFamily || ''; } catch (e) {}
+            base = base.replace(new RegExp('^\\s*["\']?' + FAM + '["\']?\\s*,\\s*'), '');
+            if (base && !/mono/i.test(base)) css.push('body{font-family:"' + FAM + '",' + base + '}');
+
+            function scanRules(rules, prefix, suffix) {
+                for (var i = 0; i < rules.length; i++) {
+                    var r = rules[i];
+                    if (r.type === 1 && r.selectorText && r.style) {
+                        var ff = r.style.getPropertyValue('font-family');
+                        if (!ff || ff.indexOf(FAM) !== -1) continue;
+                        // A mono stack must stay mono even for Arabic glyphs inside
+                        // code; icon/math faces map codepoints privately.
+                        if (/mono|icon|katex|emoji|math/i.test(ff)) continue;
+                        var bang = r.style.getPropertyPriority('font-family') ? ' !important' : '';
+                        css.push(prefix + r.selectorText + '{font-family:"' + FAM + '",' + ff + bang + '}' + suffix);
+                    } else if (r.cssRules && r.cssRules.length && typeof r.conditionText === 'string') {
+                        var at = (r.type === 12 ? '@supports ' : '@media ') + r.conditionText;
+                        scanRules(r.cssRules, prefix + at + '{', '}' + suffix);
+                    }
+                }
+            }
+            for (var si = 0; si < document.styleSheets.length; si++) {
+                var sheet = document.styleSheets[si];
+                if (sheet.ownerNode && sheet.ownerNode.id === 'claude-rtl-arabic-font') continue;
+                var rules;
+                try { rules = sheet.cssRules; } catch (e) { continue; } // cross-origin
+                if (rules) scanRules(rules, '', '');
+            }
+
+            var text = css.join('');
+            var el = document.getElementById('claude-rtl-arabic-font');
+            if (!el) {
+                el = document.createElement('style');
+                el.id = 'claude-rtl-arabic-font';
+            }
+            // (Re-)append so the shadow sheet stays behind late-loaded chunk CSS.
+            if (el.textContent !== text || el.nextSibling) {
+                el.textContent = text;
+                document.head.appendChild(el);
+            }
+        }
+
         function init() {
             injectStyles();
+            if (ARABIC_FONT) {
+                injectArabicFont();
+                // The SPA's stylesheets stream in after DOMContentLoaded; re-scan on a
+                // tapering schedule instead of observing (cheap, self-terminating).
+                [1500, 4000, 10000, 25000].forEach(function(d) { setTimeout(injectArabicFont, d); });
+                if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+                    document.fonts.ready.then(function() { injectArabicFont(); });
+                }
+            }
             processAll();
 
             // Input box live direction switching

@@ -8,11 +8,13 @@
 #>
 param(
     [switch]$Auto,
-    [string]$TrustedPubKey
+    [string]$TrustedPubKey,
+    [string]$ArabicScriptFont
 )
 
 # Env-var fallback for `irm | iex` invocations where param binding is not possible.
 if (-not $Auto -and $env:CLAUDE_RTL_AUTO -eq '1') { $Auto = $true }
+if (-not $ArabicScriptFont -and $env:CLAUDE_RTL_ARABIC_FONT) { $ArabicScriptFont = $env:CLAUDE_RTL_ARABIC_FONT }
 
 # Passed as a PARAMETER, not an env var: env vars don't survive the UAC elevation
 # boundary. Mirror it into the env var the rest of the script reads.
@@ -25,6 +27,19 @@ if ($TrustedPubKey) { $env:CLAUDE_RTL_TRUSTED_PUBKEY = $TrustedPubKey }
 $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $IsAdmin) {
     Write-Host "Requesting Administrator privileges..." -ForegroundColor Yellow
+    # -ArabicScriptFont would be lost across the update.ps1/install.ps1 delegation
+    # (parameters aren't forwarded and env vars don't survive the UAC boundary), so
+    # stage it in HKCU -- shared with the elevated same-user child, which consumes
+    # and deletes it. HKCU is standard-user-writable, so the staged value is treated
+    # as UNTRUSTED and sanitized before it ever touches the payload.
+    if ($ArabicScriptFont) {
+        try {
+            New-Item -Path 'HKCU:\Software\ClaudeRtlPatch' -Force | Out-Null
+            Set-ItemProperty -Path 'HKCU:\Software\ClaudeRtlPatch' -Name 'ArabicScriptFontPending' -Value $ArabicScriptFont
+        } catch {
+            Write-Host "Could not stage -ArabicScriptFont for the elevated run: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
     # Prefer the local verified-update helper (written admin-only at install time):
     # it verifies patch.ps1 against the pinned pubkey before elevation. Falling back
     # to the unsigned install.ps1 is acceptable only for first-time bootstrap.
@@ -94,6 +109,12 @@ $RTL_INJECTION_CODE = @'
         // Streaming markdown host: frontier blocks re-render continuously, so structural
         // work (math islands) waits for quiet.
         var STREAM_HOST_SEL = '[data-alluvium]';
+
+        // Optional Arabic-script font (issue #39). patch.ps1 splices a sanitized,
+        // locally-installed family name over the placeholder at patch time ('' = off);
+        // the guard keeps an unreplaced placeholder from being used as a font name.
+        var ARABIC_FONT = '__RTL_ARABIC_FONT__';
+        if (ARABIC_FONT.indexOf('__') === 0) ARABIC_FONT = '';
 
         function isNativeDir(el) {
             return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
@@ -784,8 +805,86 @@ function majorityDir(dirs) {
             document.head.appendChild(s);
         }
 
+        // Route Arabic-range glyphs to ARABIC_FONT without touching any other script.
+        // @font-face + local() + unicode-range defines a scoped family that only covers
+        // Arabic code points and silently no-ops when the font isn't installed. To win
+        // over claude.ai's own stacks WITHOUT overriding its font variables (fragile;
+        // the reason PR #19's approach was rejected), every same-origin font-family
+        // declaration is re-declared verbatim in a shadow stylesheet with the scoped
+        // family prepended -- appended last so source order settles the tie. Idempotent;
+        // re-run as the SPA's split CSS chunks arrive.
+        function injectArabicFont() {
+            if (!ARABIC_FONT || !document.head || !document.body) return;
+            var FAM = 'claude-rtl-arabic';
+            var RANGE = 'U+0600-06FF,U+0750-077F,U+08A0-08FF,U+FB50-FDFF,U+FE70-FEFF';
+            var css = [];
+
+            // Weight-specific faces via full + PostScript names (the static-TTF naming
+            // convention Vazirmatn and most families follow). A missing name just makes
+            // local() fail and the browser synthesize from the closest weight.
+            [['', 'Regular', '400'], [' Medium', 'Medium', '500'],
+             [' SemiBold', 'SemiBold', '600'], [' Bold', 'Bold', '700']].forEach(function(w) {
+                css.push('@font-face{font-family:"' + FAM + '";src:local("' + ARABIC_FONT + w[0] +
+                    '"),local("' + ARABIC_FONT + '-' + w[1] + '");font-weight:' + w[2] +
+                    ';unicode-range:' + RANGE + '}');
+            });
+
+            // Baseline for text that gets its stack purely by inheritance from <body>.
+            // Strip our own family before re-reading, or re-runs would stack it up.
+            var base = '';
+            try { base = getComputedStyle(document.body).fontFamily || ''; } catch (e) {}
+            base = base.replace(new RegExp('^\\s*["\']?' + FAM + '["\']?\\s*,\\s*'), '');
+            if (base && !/mono/i.test(base)) css.push('body{font-family:"' + FAM + '",' + base + '}');
+
+            function scanRules(rules, prefix, suffix) {
+                for (var i = 0; i < rules.length; i++) {
+                    var r = rules[i];
+                    if (r.type === 1 && r.selectorText && r.style) {
+                        var ff = r.style.getPropertyValue('font-family');
+                        if (!ff || ff.indexOf(FAM) !== -1) continue;
+                        // A mono stack must stay mono even for Arabic glyphs inside
+                        // code; icon/math faces map codepoints privately.
+                        if (/mono|icon|katex|emoji|math/i.test(ff)) continue;
+                        var bang = r.style.getPropertyPriority('font-family') ? ' !important' : '';
+                        css.push(prefix + r.selectorText + '{font-family:"' + FAM + '",' + ff + bang + '}' + suffix);
+                    } else if (r.cssRules && r.cssRules.length && typeof r.conditionText === 'string') {
+                        var at = (r.type === 12 ? '@supports ' : '@media ') + r.conditionText;
+                        scanRules(r.cssRules, prefix + at + '{', '}' + suffix);
+                    }
+                }
+            }
+            for (var si = 0; si < document.styleSheets.length; si++) {
+                var sheet = document.styleSheets[si];
+                if (sheet.ownerNode && sheet.ownerNode.id === 'claude-rtl-arabic-font') continue;
+                var rules;
+                try { rules = sheet.cssRules; } catch (e) { continue; } // cross-origin
+                if (rules) scanRules(rules, '', '');
+            }
+
+            var text = css.join('');
+            var el = document.getElementById('claude-rtl-arabic-font');
+            if (!el) {
+                el = document.createElement('style');
+                el.id = 'claude-rtl-arabic-font';
+            }
+            // (Re-)append so the shadow sheet stays behind late-loaded chunk CSS.
+            if (el.textContent !== text || el.nextSibling) {
+                el.textContent = text;
+                document.head.appendChild(el);
+            }
+        }
+
         function init() {
             injectStyles();
+            if (ARABIC_FONT) {
+                injectArabicFont();
+                // The SPA's stylesheets stream in after DOMContentLoaded; re-scan on a
+                // tapering schedule instead of observing (cheap, self-terminating).
+                [1500, 4000, 10000, 25000].forEach(function(d) { setTimeout(injectArabicFont, d); });
+                if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
+                    document.fonts.ready.then(function() { injectArabicFont(); });
+                }
+            }
             processAll();
 
             // Input box live direction switching
@@ -1047,6 +1146,129 @@ function Find-AllBytesWithProgress {
 $global:RtlStateDir  = Join-Path $env:ProgramData "ClaudeRtlPatch"
 $global:RtlStateFile = Join-Path $global:RtlStateDir "state.json"
 $global:RtlTaskName  = "ClaudeRtlPatchWatcher"
+
+# -----------------------------------------------------------------------------
+# OPTIONAL ARABIC-SCRIPT FONT (issue #39)
+# -----------------------------------------------------------------------------
+$script:ArabicFontFile     = Join-Path $global:RtlStateDir 'arabic-font.txt'
+$script:ArabicFontStageKey = 'HKCU:\Software\ClaudeRtlPatch'
+# Letters/digits/spaces/hyphens only, max 63 chars: admits every real family name
+# while excluding quotes, backslashes and braces, so the name spliced into the JS
+# payload cannot escape the string literal it lands in.
+$script:ArabicFontNameRe   = '^[A-Za-z0-9][A-Za-z0-9 \-]{0,62}$'
+
+# Resolves the Arabic-script font for this run: explicit -ArabicScriptFont beats a
+# value staged in HKCU by a pre-elevation invocation, which beats the per-machine
+# config persisted in the protected state dir (what keeps the choice across auto
+# re-patches after Claude updates). 'none' clears the persisted config. Returns ''
+# when the feature is off. Every source -- including the persisted file -- is
+# validated against $ArabicFontNameRe before use.
+function Resolve-ArabicScriptFont {
+    $name = $script:ArabicScriptFont
+    $src  = '-ArabicScriptFont parameter'
+
+    if (-not $name) {
+        try {
+            $name = (Get-ItemProperty -Path $script:ArabicFontStageKey -Name 'ArabicScriptFontPending' -ErrorAction Stop).ArabicScriptFontPending
+            $src  = 'pre-elevation staged request'
+        } catch { $name = $null }
+    }
+    # Consume the stage unconditionally so a stale (or hostile) HKCU value can't
+    # flip a later auto re-patch run.
+    Remove-ItemProperty -Path $script:ArabicFontStageKey -Name 'ArabicScriptFontPending' -ErrorAction SilentlyContinue
+
+    if ($name) {
+        if ($name -ieq 'none') {
+            Remove-Item -LiteralPath $script:ArabicFontFile -Force -ErrorAction SilentlyContinue
+            Write-Log "Arabic-script font disabled ('none'); persisted config cleared."
+            return ''
+        }
+        if ($name -notmatch $script:ArabicFontNameRe) {
+            Write-Warn "Ignoring Arabic-script font '$name' ($src): only letters, digits, spaces and hyphens are allowed (max 63 chars)."
+            $name = $null
+        } else {
+            try {
+                if (-not (Test-Path $global:RtlStateDir)) { New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null }
+                [System.IO.File]::WriteAllText($script:ArabicFontFile, $name, [System.Text.UTF8Encoding]::new($false))
+                Write-Log "Arabic-script font '$name' ($src) persisted for future re-patches."
+            } catch {
+                Write-Warn "Could not persist the Arabic-script font choice: $($_.Exception.Message)"
+            }
+            return $name
+        }
+    }
+
+    if (Test-Path $script:ArabicFontFile) {
+        try {
+            $saved = ([System.IO.File]::ReadAllText($script:ArabicFontFile)).Trim()
+            if ($saved -match $script:ArabicFontNameRe) { return $saved }
+            Write-Warn "Persisted Arabic-script font config is invalid; ignoring it."
+        } catch { }
+    }
+    return ''
+}
+
+# Interactive menu flow for the same setting (no flag or env var needed): shows the
+# current choice, validates and persists a new one, and offers to re-apply the
+# patch immediately (the font only takes effect at injection time).
+function Set-ArabicScriptFontMenu {
+    Write-Host "`n--- Persian/Arabic Font (optional) ---" -ForegroundColor Cyan
+    $current = ''
+    if (Test-Path $script:ArabicFontFile) {
+        try { $current = ([System.IO.File]::ReadAllText($script:ArabicFontFile)).Trim() } catch { }
+    }
+    if ($current) { Write-Host "Current font: $current" -ForegroundColor Green }
+    else          { Write-Host "Current font: (none - system default)" -ForegroundColor DarkGray }
+    Write-Host ""
+    Write-Host "Routes Persian/Arabic glyphs (and ONLY them) to a font installed on this"
+    Write-Host "machine. Latin, Hebrew and code are untouched. The font must already be"
+    Write-Host "installed -- e.g. Vazirmatn, the de-facto standard for Persian text:"
+    Write-Host "  https://github.com/rastikerdar/vazirmatn/releases" -ForegroundColor Cyan
+    Write-Host ""
+
+    $answer = Read-Host "Font family name (e.g. Vazirmatn) / 'none' to disable / Enter to cancel"
+    if (-not $answer) { Write-Host "No change."; return }
+    $answer = $answer.Trim()
+
+    if ($answer -ieq 'none') {
+        Remove-Item -LiteralPath $script:ArabicFontFile -Force -ErrorAction SilentlyContinue
+        Write-Success "Arabic-script font disabled."
+        Write-Host "Re-apply the patch (menu option 1) for this to take effect." -ForegroundColor Yellow
+        return
+    }
+    if ($answer -notmatch $script:ArabicFontNameRe) {
+        Write-Warn "Invalid name: only letters, digits, spaces and hyphens are allowed (max 63 chars)."
+        return
+    }
+
+    # Non-blocking sanity check: warn when the family doesn't look installed. GDI+
+    # sees per-user and machine fonts; weight-suffixed GDI families ("X SemiBold")
+    # make this a prefix match, and a miss is only a warning -- with the font absent
+    # the injected CSS local() simply never activates.
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+        $fams = (New-Object System.Drawing.Text.InstalledFontCollection).Families
+        $found = $fams | Where-Object { $_.Name -ieq $answer -or $_.Name -like "$answer *" }
+        if (-not $found) {
+            Write-Warn "'$answer' does not appear to be installed for this user. The patch will still apply cleanly, but the font won't show until you install it."
+        }
+    } catch { }
+
+    try {
+        if (-not (Test-Path $global:RtlStateDir)) { New-Item -ItemType Directory -Path $global:RtlStateDir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($script:ArabicFontFile, $answer, [System.Text.UTF8Encoding]::new($false))
+        Write-Success "Saved: $answer"
+    } catch {
+        Write-Warn "Could not save the choice: $($_.Exception.Message)"
+        return
+    }
+
+    Write-Host "The font takes effect the next time the patch is applied." -ForegroundColor Yellow
+    $apply = Read-Host "Apply the patch now? This closes Claude Desktop (Y/n)"
+    if ($apply -ne 'n' -and $apply -ne 'N') {
+        try { Install-Patch } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+    }
+}
 
 # -----------------------------------------------------------------------------
 # TRUST-ANCHOR DIRECTORY HARDENING
@@ -2565,6 +2787,15 @@ function Install-Patch {
             }
             Write-Log "Main-process entry: $MainEntryFile"
 
+            # Optional Arabic-script font (issue #39): splice the sanitized name (or ''
+            # when off) over the payload's placeholder. Runtime substitution on the
+            # in-memory copy -- the signed patch.ps1 on disk is untouched.
+            $ArabicFontName = Resolve-ArabicScriptFont
+            if ($ArabicFontName) {
+                Write-Success "Arabic-script font enabled: '$ArabicFontName' (must be installed on this machine; disable with -ArabicScriptFont none)"
+            }
+            $RendererInjection = $RTL_INJECTION_CODE.Replace('__RTL_ARABIC_FONT__', $ArabicFontName)
+
             # Non-renderer files that must NOT receive the renderer payload (no DOM;
             # injecting risks breaking MCP startup -- #14). index.js is the large main
             # bundle; the rest are Node MCP hosts/workers. All skipped entirely.
@@ -2618,9 +2849,9 @@ function Install-Patch {
                 if ($content -match "CLAUDE RTL PATCH START") { continue }
                 if ($content -match $strictRe) {
                     $prologue = $matches[0]
-                    $newContent = $prologue + "`n" + $RTL_INJECTION_CODE + "`n" + $content.Substring($prologue.Length)
+                    $newContent = $prologue + "`n" + $RendererInjection + "`n" + $content.Substring($prologue.Length)
                 } else {
-                    $newContent = $RTL_INJECTION_CODE + "`n" + $content
+                    $newContent = $RendererInjection + "`n" + $content
                 }
                 [System.IO.File]::WriteAllText($file.FullName, $newContent, $utf8NoBom)
                 $Injected++
@@ -3131,9 +3362,10 @@ function Show-Menu {
     Write-Host "  3. Create 'Quick Update' Desktop Shortcut" -ForegroundColor Green
     Write-Host "  4. Enable Auto Re-Patch After Each Claude Update (Background Service)" -ForegroundColor Green
     Write-Host "  5. Disable Auto Re-Patch Service" -ForegroundColor White
-    Write-Host "  6. Exit" -ForegroundColor White
+    Write-Host "  6. Set Persian/Arabic Font (e.g. Vazirmatn, Optional)" -ForegroundColor Green
+    Write-Host "  7. Exit" -ForegroundColor White
 
-    $choice = Read-Host "`nEnter your choice (1/2/3/4/5/6)"
+    $choice = Read-Host "`nEnter your choice (1/2/3/4/5/6/7)"
 
     if ($choice -eq '1' -or $choice -eq '2') {
         Write-Host "`nWARNING: This will automatically close Claude Desktop and its background services." -ForegroundColor Yellow
@@ -3174,7 +3406,13 @@ function Show-Menu {
         $null = Read-Host
         Show-Menu
     }
-    elseif ($choice -eq '6') { Exit }
+    elseif ($choice -eq '6') {
+        try { Set-ArabicScriptFontMenu } catch { Write-Host $_.Exception.Message -ForegroundColor Red }
+        Write-Host "`nPress Enter to return to menu..."
+        $null = Read-Host
+        Show-Menu
+    }
+    elseif ($choice -eq '7') { Exit }
     else { Show-Menu }
 }
 
