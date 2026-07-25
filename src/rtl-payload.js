@@ -29,11 +29,14 @@
         // work (math islands) waits for quiet.
         var STREAM_HOST_SEL = '[data-alluvium]';
 
-        // Optional Arabic-script font (issue #39). patch.ps1 splices a sanitized,
-        // locally-installed family name over the placeholder at patch time ('' = off);
-        // the guard keeps an unreplaced placeholder from being used as a font name.
-        var ARABIC_FONT = '__RTL_ARABIC_FONT__';
-        if (ARABIC_FONT.indexOf('__') === 0) ARABIC_FONT = '';
+        // Optional custom text font (issue #39). patch.ps1 splices a sanitized,
+        // locally-installed family name over the placeholder at patch time ('' = off),
+        // plus a scope: 'arabic' | 'hebrew' | 'all' (which glyphs the font covers).
+        // The guards keep unreplaced placeholders from leaking into live values.
+        var CUSTOM_FONT = '__RTL_CUSTOM_FONT__';
+        if (CUSTOM_FONT.indexOf('__') === 0) CUSTOM_FONT = '';
+        var CUSTOM_FONT_SCOPE = '__RTL_CUSTOM_FONT_SCOPE__';
+        if (CUSTOM_FONT_SCOPE.indexOf('__') === 0) CUSTOM_FONT_SCOPE = 'arabic';
 
         function isNativeDir(el) {
             return el.hasAttribute('dir') && !el.hasAttribute(MANAGED_FLAG);
@@ -439,18 +442,24 @@
             document.head.appendChild(s);
         }
 
-        // Route Arabic-range glyphs to ARABIC_FONT without touching any other script.
-        // @font-face + local() + unicode-range defines a scoped family that only covers
-        // Arabic code points and silently no-ops when the font isn't installed. To win
-        // over claude.ai's own stacks WITHOUT overriding its font variables (fragile;
-        // the reason PR #19's approach was rejected), every same-origin font-family
-        // declaration is re-declared verbatim in a shadow stylesheet with the scoped
-        // family prepended -- appended last so source order settles the tie. Idempotent;
-        // re-run as the SPA's split CSS chunks arrive.
-        function injectArabicFont() {
-            if (!ARABIC_FONT || !document.head || !document.body) return;
-            var FAM = 'claude-rtl-arabic';
-            var RANGE = 'U+0600-06FF,U+0750-077F,U+08A0-08FF,U+FB50-FDFF,U+FE70-FEFF';
+        // Route glyphs in CUSTOM_FONT_SCOPE to CUSTOM_FONT without touching any other
+        // script. @font-face + local() (+ unicode-range for the script-limited scopes)
+        // defines a scoped family that silently no-ops when the font isn't installed.
+        // To win over claude.ai's own stacks WITHOUT overriding its font variables
+        // (fragile; the reason PR #19's approach was rejected), every same-origin
+        // font-family declaration is re-declared verbatim in a shadow stylesheet with
+        // the scoped family prepended -- appended last so source order settles the
+        // tie. Idempotent; re-run as the SPA's split CSS chunks arrive.
+        function injectCustomFont() {
+            if (!CUSTOM_FONT || !document.head || !document.body) return;
+            var FAM = 'claude-rtl-custom';
+            var RANGES = {
+                arabic: 'U+0600-06FF,U+0750-077F,U+08A0-08FF,U+FB50-FDFF,U+FE70-FEFF',
+                hebrew: 'U+0590-05FF,U+FB1D-FB4F'
+            };
+            // 'all' (or anything unknown) -> no unicode-range: the face covers every
+            // glyph the font supplies; glyphs it lacks fall through to the next family.
+            var range = RANGES[CUSTOM_FONT_SCOPE] || '';
             var css = [];
 
             // Weight-specific faces via full + PostScript names (the static-TTF naming
@@ -458,9 +467,9 @@
             // local() fail and the browser synthesize from the closest weight.
             [['', 'Regular', '400'], [' Medium', 'Medium', '500'],
              [' SemiBold', 'SemiBold', '600'], [' Bold', 'Bold', '700']].forEach(function(w) {
-                css.push('@font-face{font-family:"' + FAM + '";src:local("' + ARABIC_FONT + w[0] +
-                    '"),local("' + ARABIC_FONT + '-' + w[1] + '");font-weight:' + w[2] +
-                    ';unicode-range:' + RANGE + '}');
+                css.push('@font-face{font-family:"' + FAM + '";src:local("' + CUSTOM_FONT + w[0] +
+                    '"),local("' + CUSTOM_FONT + '-' + w[1] + '");font-weight:' + w[2] +
+                    (range ? ';unicode-range:' + range : '') + '}');
             });
 
             // Baseline for text that gets its stack purely by inheritance from <body>.
@@ -489,17 +498,17 @@
             }
             for (var si = 0; si < document.styleSheets.length; si++) {
                 var sheet = document.styleSheets[si];
-                if (sheet.ownerNode && sheet.ownerNode.id === 'claude-rtl-arabic-font') continue;
+                if (sheet.ownerNode && sheet.ownerNode.id === 'claude-rtl-custom-font') continue;
                 var rules;
                 try { rules = sheet.cssRules; } catch (e) { continue; } // cross-origin
                 if (rules) scanRules(rules, '', '');
             }
 
             var text = css.join('');
-            var el = document.getElementById('claude-rtl-arabic-font');
+            var el = document.getElementById('claude-rtl-custom-font');
             if (!el) {
                 el = document.createElement('style');
-                el.id = 'claude-rtl-arabic-font';
+                el.id = 'claude-rtl-custom-font';
             }
             // (Re-)append so the shadow sheet stays behind late-loaded chunk CSS.
             if (el.textContent !== text || el.nextSibling) {
@@ -510,13 +519,13 @@
 
         function init() {
             injectStyles();
-            if (ARABIC_FONT) {
-                injectArabicFont();
+            if (CUSTOM_FONT) {
+                injectCustomFont();
                 // The SPA's stylesheets stream in after DOMContentLoaded; re-scan on a
                 // tapering schedule instead of observing (cheap, self-terminating).
-                [1500, 4000, 10000, 25000].forEach(function(d) { setTimeout(injectArabicFont, d); });
+                [1500, 4000, 10000, 25000].forEach(function(d) { setTimeout(injectCustomFont, d); });
                 if (document.fonts && document.fonts.ready && document.fonts.ready.then) {
-                    document.fonts.ready.then(function() { injectArabicFont(); });
+                    document.fonts.ready.then(function() { injectCustomFont(); });
                 }
             }
             processAll();
