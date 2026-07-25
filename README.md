@@ -98,11 +98,11 @@ Prefer reading in a different typeface? The patch can render Claude's text in an
 
 ### How to enable it, step by step
 
-1. **Install the font** (one time, no admin needed). For Vazirmatn, for example:
-   - Download the latest `vazirmatn-vXX.XXX.zip` from the [official releases page](https://github.com/rastikerdar/vazirmatn/releases) and extract it.
-   - Open the extracted `fonts/ttf` folder, select **all** the `.ttf` files, right-click → **Install**.
+1. **Install the font** (one time, no admin needed): download it, extract, select **all** the `.ttf` files, right-click → **Install**.
+   - Persian/Arabic — **Vazirmatn**: the latest `vazirmatn-vXX.XXX.zip` from the [official releases page](https://github.com/rastikerdar/vazirmatn/releases) (the `.ttf` files are under `fonts/ttf`).
+   - Hebrew — **Heebo** / **Rubik** / **Assistant**: download from [Google Fonts](https://fonts.google.com/).
 2. **Run the patcher** (see [Quick install](#-quick-install) above) and choose **6. Set a Custom Text Font** from the menu.
-3. Type the font's family name — e.g. `Vazirmatn` or `Heebo` — and press Enter. The patcher warns you if the font doesn't look installed.
+3. Type the font's family name — e.g. `Vazirmatn` or `Heebo` — and press Enter. If the name doesn't look installed, the patcher asks you to re-type it (or confirm using it anyway).
 4. Pick the scope: **1** Arabic/Persian only, **2** Hebrew only, or **3** all text.
 5. Answer **Y** when asked *"Apply the patch now?"* (this closes Claude Desktop and re-applies the patch with the font enabled).
 6. Open Claude Desktop again. The chosen text now renders in your font; everything else is unchanged.

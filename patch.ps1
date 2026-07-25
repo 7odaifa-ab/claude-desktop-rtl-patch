@@ -1285,33 +1285,42 @@ function Set-CustomFontMenu {
     Write-Host "  https://github.com/rastikerdar/vazirmatn/releases" -ForegroundColor Cyan
     Write-Host ""
 
-    $answer = Read-Host "Font family name (e.g. Vazirmatn) / 'none' to disable / Enter to cancel"
-    if (-not $answer) { Write-Host "No change."; return }
-    $answer = $answer.Trim()
+    # Loop until the name is valid AND looks installed (or the user insists):
+    # with the font absent the injected CSS local() never activates, so an
+    # uninstalled name is almost always a typo. 'y' overrides for the rare
+    # family GDI+ can't see, or an install-the-font-later flow.
+    while ($true) {
+        $answer = Read-Host "Font family name (e.g. Vazirmatn) / 'none' to disable / Enter to cancel"
+        if (-not $answer) { Write-Host "No change."; return }
+        $answer = $answer.Trim()
 
-    if ($answer -ieq 'none') {
-        Remove-Item -LiteralPath $script:CustomFontFile -Force -ErrorAction SilentlyContinue
-        Write-Success "Custom font disabled."
-        Write-Host "Re-apply the patch (menu option 1) for this to take effect." -ForegroundColor Yellow
-        return
-    }
-    if ($answer -notmatch $script:CustomFontNameRe) {
-        Write-Warn "Invalid name: only letters, digits, spaces and hyphens are allowed (max 63 chars)."
-        return
-    }
-
-    # Non-blocking sanity check: warn when the family doesn't look installed. GDI+
-    # sees per-user and machine fonts; weight-suffixed GDI families ("X SemiBold")
-    # make this a prefix match, and a miss is only a warning -- with the font absent
-    # the injected CSS local() simply never activates.
-    try {
-        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
-        $fams = (New-Object System.Drawing.Text.InstalledFontCollection).Families
-        $found = $fams | Where-Object { $_.Name -ieq $answer -or $_.Name -like "$answer *" }
-        if (-not $found) {
-            Write-Warn "'$answer' does not appear to be installed for this user. The patch will still apply cleanly, but the font won't show until you install it."
+        if ($answer -ieq 'none') {
+            Remove-Item -LiteralPath $script:CustomFontFile -Force -ErrorAction SilentlyContinue
+            Write-Success "Custom font disabled."
+            Write-Host "Re-apply the patch (menu option 1) for this to take effect." -ForegroundColor Yellow
+            return
         }
-    } catch { }
+        if ($answer -notmatch $script:CustomFontNameRe) {
+            Write-Warn "Invalid name: only letters, digits, spaces and hyphens are allowed (max 63 chars). Try again."
+            continue
+        }
+
+        # GDI+ sees per-user and machine fonts; weight-suffixed GDI families
+        # ("X SemiBold") make this a prefix match. If the check itself fails,
+        # give the name the benefit of the doubt.
+        $installed = $true
+        try {
+            Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+            $fams = (New-Object System.Drawing.Text.InstalledFontCollection).Families
+            $installed = [bool]($fams | Where-Object { $_.Name -ieq $answer -or $_.Name -like "$answer *" })
+        } catch { }
+        if (-not $installed) {
+            Write-Warn "'$answer' does not appear to be installed for this user."
+            $anyway = Read-Host "Use it anyway? The font won't show until you install it (y/N)"
+            if ($anyway -ne 'y' -and $anyway -ne 'Y') { continue }
+        }
+        break
+    }
 
     Write-Host ""
     Write-Host "Apply the font to which text?"
@@ -1319,13 +1328,16 @@ function Set-CustomFontMenu {
     Write-Host "  2. Hebrew text only"
     Write-Host "  3. All text"
     $defNum = switch ($cfg.Scope) { 'hebrew' { '2' } 'all' { '3' } default { '1' } }
-    $pick = Read-Host "Scope (1/2/3) [Enter = $defNum]"
-    if (-not $pick) { $pick = $defNum }
-    $scope = switch ($pick.Trim()) {
-        '1' { 'arabic' } '2' { 'hebrew' } '3' { 'all' }
-        default { $null }
+    $scope = $null
+    while (-not $scope) {
+        $pick = Read-Host "Scope (1/2/3) [Enter = $defNum]"
+        if (-not $pick) { $pick = $defNum }
+        $scope = switch ($pick.Trim()) {
+            '1' { 'arabic' } '2' { 'hebrew' } '3' { 'all' }
+            default { $null }
+        }
+        if (-not $scope) { Write-Warn "Please answer 1, 2 or 3." }
     }
-    if (-not $scope) { Write-Warn "Invalid choice; nothing changed."; return }
 
     try {
         Save-CustomFontConfig $answer $scope

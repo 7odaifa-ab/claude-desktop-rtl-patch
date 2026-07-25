@@ -98,11 +98,11 @@ irm https://raw.githubusercontent.com/shraga100/claude-desktop-rtl-patch/main/in
 
 ### איך מפעילים, צעד אחר צעד
 
-1. **מתקינים את הפונט** (פעם אחת, בלי אדמין). עבור Vazirmatn, למשל:
-   - מורידים את ה-`vazirmatn-vXX.XXX.zip` העדכני מ[דף ההורדות הרשמי](https://github.com/rastikerdar/vazirmatn/releases) ומחלצים.
-   - נכנסים לתיקייה `fonts/ttf` שחולצה, מסמנים את **כל** קובצי ה-`.ttf`, קליק ימני → **Install**.
+1. **מתקינים את הפונט** (פעם אחת, בלי אדמין): מורידים, מחלצים, מסמנים את **כל** קובצי ה-`.ttf`, קליק ימני → **Install**.
+   - פרסית/ערבית — **Vazirmatn**: ה-`vazirmatn-vXX.XXX.zip` העדכני מ[דף ההורדות הרשמי](https://github.com/rastikerdar/vazirmatn/releases) (קובצי ה-`.ttf` תחת `fonts/ttf`).
+   - עברית — **Heebo** / **Rubik** / **Assistant**: מורידים מ-[Google Fonts](https://fonts.google.com/).
 2. **מריצים את המתקין** (ראו [התקנה מהירה](#-התקנה-מהירה) למעלה) ובוחרים **6. Set a Custom Text Font** מהתפריט.
-3. מקלידים את שם משפחת הפונט — למשל `Vazirmatn` או `Heebo` — ומקישים Enter. המתקין יזהיר אם הפונט לא נראה מותקן.
+3. מקלידים את שם משפחת הפונט — למשל `Vazirmatn` או `Heebo` — ומקישים Enter. אם השם לא נראה מותקן, המתקין יבקש להקליד שוב (או לאשר להשתמש בו בכל זאת).
 4. בוחרים היקף: **1** ערבית/פרסית בלבד, **2** עברית בלבד, או **3** כל הטקסט.
 5. עונים **Y** לשאלה *"?Apply the patch now"* (זה סוגר את Claude Desktop ומחיל את הפאצ' מחדש עם הפונט).
 6. פותחים שוב את Claude Desktop. הטקסט שנבחר מוצג כעת בפונט שלכם; כל השאר ללא שינוי.
