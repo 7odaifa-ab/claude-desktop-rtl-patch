@@ -86,6 +86,15 @@ When you run the script, you get an interactive menu:
 
 ---
 
+## 🔄 Keeping the patch applied
+
+Claude Desktop updates often, and each update overwrites the patch. Two optional features keep it effortless:
+
+- **Quick Update shortcut (option 3):** a desktop shortcut named **"Update Claude RTL"**. Double-click it to silently fetch and re-apply the latest patch.
+- **Auto-updater (option 4):** a lightweight Windows scheduled task that detects when a new `claude.exe` version launches, re-applies the patch automatically, and shows a notification when it's done.
+
+---
+
 ## 🔤 Optional: custom text font
 
 Prefer reading in a different typeface? The patch can render Claude's text in any font that is **already installed on your machine**, and you choose which text it applies to:
@@ -123,15 +132,6 @@ Prefer reading in a different typeface? The patch can render Claude's text in an
 - **Persistent:** the choice is saved (in `ProgramData\ClaudeRtlPatch`) and survives auto re-patches after Claude updates — set it once and forget it.
 - **Disable:** menu option 6 → type `none` (or `.\patch.ps1 -CustomFont none`), then re-apply the patch.
 - Any family name of letters/digits/spaces/hyphens works, e.g. `"Noto Naskh Arabic"`.
-
----
-
-## 🔄 Keeping the patch applied
-
-Claude Desktop updates often, and each update overwrites the patch. Two optional features keep it effortless:
-
-- **Quick Update shortcut (option 3):** a desktop shortcut named **"Update Claude RTL"**. Double-click it to silently fetch and re-apply the latest patch.
-- **Auto-updater (option 4):** a lightweight Windows scheduled task that detects when a new `claude.exe` version launches, re-applies the patch automatically, and shows a notification when it's done.
 
 ---
 
